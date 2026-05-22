@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 280 56" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d03050"/>
+      <stop offset="0.55" stop-color="#e8804a"/>
+      <stop offset="1" stop-color="#f0c050"/>
+    </linearGradient>
+    <linearGradient id="brand" x1="60" y1="0" x2="280" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#d03050"/>
+      <stop offset="0.7" stop-color="#c0451e"/>
+      <stop offset="1" stop-color="#a36015"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ===== Mark: TAS + candlestick trend ===== -->
+  <g>
+    <rect x="2" y="2" width="52" height="52" rx="10" fill="url(#bg)"/>
+
+    <text x="28" y="28" text-anchor="middle"
+          font-family="-apple-system,Segoe UI,Roboto,Arial,sans-serif"
+          font-weight="800" font-size="17" letter-spacing="-1"
+          fill="#ffffff">TAS</text>
+
+    <g stroke="#ffffff" stroke-width="1.2" stroke-linecap="round">
+      <line x1="13" y1="38" x2="13" y2="49"/>
+      <line x1="28" y1="35" x2="28" y2="49"/>
+      <line x1="43" y1="31" x2="43" y2="49"/>
+    </g>
+    <rect x="11.4" y="39.5" width="3.2" height="7"  fill="#ffffff" rx="0.4"/>
+    <rect x="26.4" y="36.5" width="3.2" height="9"  fill="#ffffff" rx="0.4"/>
+    <rect x="41.4" y="33"   width="3.2" height="12" fill="#ffffff" rx="0.4"/>
+
+    <polyline points="13,39.5 28,36.5 43,33" stroke="#ffffff" stroke-width="1.2"
+              stroke-linecap="round" stroke-linejoin="round" fill="none" opacity="0.85"/>
+    <polygon points="43,33 46.5,34.5 45,38" fill="#ffffff" opacity="0.85"/>
+  </g>
+
+  <!-- ===== Wordmark — single line, centred vertically ===== -->
+  <text x="64" y="35" fill="url(#brand)"
+        font-family="-apple-system,Segoe UI,Roboto,Arial,sans-serif"
+        font-weight="700" font-size="18" letter-spacing="-0.3">TradingAgents Studio</text>
+</svg>

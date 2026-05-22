@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradingagents-studio"
+version = "0.3.0"
+description = "TradingAgents-Studio: A web-enabled, China-extended fork of the TradingAgents multi-agent LLM trading framework (Apache 2.0)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # Core agent framework
+    "langchain-core>=0.3.81",
+    "langchain-anthropic>=0.3.15",
+    "langchain-experimental>=0.3.4",
+    "langchain-google-genai>=4.0.0",
+    "langchain-openai>=0.3.23",
+    "langgraph>=0.4.8",
+    "langgraph-checkpoint-sqlite>=2.0.0",
+    # Data & analytics
+    "pandas>=2.3.0",
+    "yfinance>=0.2.63",
+    "stockstats>=0.6.5",
+    "backtrader>=1.9.78.123",
+    # Utility / CLI
+    "parsel>=1.10.0",
+    "pytz>=2025.2",
+    "questionary>=2.1.0",
+    "requests>=2.32.4",
+    "rich>=14.0.0",
+    "typer>=0.21.0",
+    "setuptools>=80.9.0",
+    "tqdm>=4.67.1",
+    "typing-extensions>=4.14.0",
+]
+
+[project.optional-dependencies]
+# Web Studio (FastAPI + WebSocket)
+web = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.34.0",
+    "websockets>=14.0",
+]
+# A-share market data (AKShare = free default for CN tickers)
+cn = [
+    "akshare>=1.14.0",
+]
+# Optional A-share paid-grade fallback (Tushare Pro, needs token)
+cn-pro = [
+    "tushare>=1.4.0",
+]
+# A-share sentiment: 东方财富股吧 HTML parser + optional
+# MediaCrawler MySQL backend for 微博 / 小红书 / 抖音
+cn-social = [
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "pymysql>=1.1.0",
+]
+# Everything except dev tooling — convenient one-liner install
+all = [
+    "tradingagents-studio[web,cn,cn-pro,cn-social]",
+]
+# Test tooling
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
+[project.scripts]
+tradingagents = "cli.main:app"
+tradingagents-web = "web.backend.run:main"
+
+[tool.setuptools.packages.find]
+include = ["tradingagents*", "cli*", "web*"]
+
+[tool.setuptools.package-data]
+cli = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "unit: fast isolated unit tests",
+    "integration: tests requiring external services",
+    "smoke: quick sanity-check tests",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
