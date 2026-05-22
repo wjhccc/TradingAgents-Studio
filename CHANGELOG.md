@@ -14,6 +14,10 @@ Breaking changes within the 0.x line are called out explicitly.
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [Studio 0.4.0] — 2026-05-22
+
 This section accumulates changes made on top of `Studio 0.3.0`. They will
 be rolled into a versioned release when the surface stabilises.
 
