@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import init_db
-from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest
+from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, quality
 from .scheduler import service as scheduler_service
 
 _LOG_FILE = Path(__file__).parent.parent.parent / "web_server.log"
@@ -58,6 +58,7 @@ app.include_router(schedule.router)
 app.include_router(paper.router)
 app.include_router(quote.router)
 app.include_router(backtest.router)
+app.include_router(quality.router)
 
 
 @app.get("/api/health")

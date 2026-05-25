@@ -8,6 +8,7 @@ const routes = [
   { path: '/schedule', name: 'schedule', component: () => import('./pages/Schedule.vue') },
   { path: '/paper', name: 'paper', component: () => import('./pages/Paper.vue') },
   { path: '/backtest', name: 'backtest', component: () => import('./pages/Backtest.vue') },
+  { path: '/quality', name: 'quality', component: () => import('./pages/Quality.vue') },
   { path: '/history', name: 'history', component: () => import('./pages/History.vue') },
   { path: '/report/:id', name: 'report', component: () => import('./pages/ReportDetail.vue') },
   { path: '/settings', name: 'settings', component: () => import('./pages/Settings.vue') },

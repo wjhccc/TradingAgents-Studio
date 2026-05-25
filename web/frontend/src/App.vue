@@ -63,6 +63,7 @@ import {
   AlarmOutline,
   TrendingUpOutline,
   StatsChartOutline,
+  AnalyticsOutline,
   LanguageOutline,
 } from '@vicons/ionicons5'
 import { naiveLocale, naiveDateLocale, setLocale } from './i18n'
@@ -105,6 +106,7 @@ const menuOptions = computed(() => [
   { label: t('menu.schedule'), key: 'schedule', icon: renderIcon(AlarmOutline) },
   { label: t('menu.paper'), key: 'paper', icon: renderIcon(TrendingUpOutline) },
   { label: t('menu.backtest'), key: 'backtest', icon: renderIcon(StatsChartOutline) },
+  { label: t('menu.quality'), key: 'quality', icon: renderIcon(AnalyticsOutline) },
   { label: t('menu.history'), key: 'history', icon: renderIcon(TimeOutline) },
   { label: t('menu.settings'), key: 'settings', icon: renderIcon(SettingsOutline) },
 ])

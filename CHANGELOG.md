@@ -23,6 +23,41 @@ be rolled into a versioned release when the surface stabilises.
 
 ### Added
 
+- **Decision-quality dashboard (`/quality`).** Replays every completed
+  Agent decision against real historical prices and answers the question
+  the rest of the UI dodges: *"is the Agent actually making good calls?"*
+  For each analysis, the page pulls the close on the analysis date and N
+  trading days later (5 / 30 / 60, user-toggled) from the same vendor the
+  agents used, subtracts the regional benchmark return over the same
+  window, and reports **alpha**. KPIs include overall win-rate, average
+  & median alpha, alpha-Sharpe, best/worst alpha; the page also surfaces:
+  - **Confidence calibration curve** — buckets directional decisions by
+    reported confidence and plots actual win-rate vs. the bucket center.
+    Lets users spot over- or under-confident agents at a glance.
+  - **Breakdown by dimension** — ticker / signal / single analyst /
+    analyst combo / LLM model, each with win-rate + avg alpha + per-
+    decision Sharpe so users can see which configuration of analysts +
+    LLM actually wins. The "by analyst" mode counts a single analysis
+    once per analyst it used, so e.g. "did adding `capital_flow` to my
+    runs improve alpha?" gets a direct answer.
+  - **Per-day heatmap** — calendar-grid color-coded by that day's
+    average alpha. Red = positive (CN convention), green = negative,
+    saturation clips at ±10%.
+  - **Decision list** — every analysis with realised return / alpha /
+    win-loss, filterable by ticker + signal + only-evaluable, deep-
+    linked to the source Report Detail.
+  Benchmarks are auto-picked per market (CSI 300 for A-share, HSI for
+  HK, SPY for US, N225 for Japan, etc.), matching the same logic the
+  reflection layer uses. Computed on demand — no new tables; price
+  series cached in-process (10 min TTL) so even a full-history rebuild
+  only hits the vendor a few times per ticker. HOLD decisions are listed
+  but excluded from the win-rate aggregates since there's no implied
+  position.
+  - New: `web/backend/routers/quality.py`
+  - New: `web/frontend/src/pages/Quality.vue`
+  - Modified: `web/backend/main.py` (register router)
+  - Modified: `web/frontend/src/router.ts`, `src/App.vue` (route + menu)
+  - Modified: `web/frontend/src/i18n/locales/zh-CN.ts`, `en-US.ts`
 - **Backtesting engine — Phase 1: Agent historical decision replay.** A
   self-contained event-driven backtest framework written from scratch
   (no vnpy / backtrader / zipline / AI-Trader code; engine architecture
