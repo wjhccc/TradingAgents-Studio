@@ -22,8 +22,6 @@
 
 <!-- screenshot:hero -->
 
-> *Screenshot placeholder — drop your hero image at `assets/screenshots/hero.png` and uncomment the line above.*
-
 ---
 
 ## ✨ What makes Studio different

@@ -22,8 +22,6 @@
 
 <!-- screenshot:hero -->
 
-> *截图占位 — 把主视觉图放到 `assets/screenshots/hero.png`,然后取消上面那行注释即可。*
-
 ---
 
 ## ✨ Studio 不一样在哪
