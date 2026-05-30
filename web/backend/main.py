@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,14 +17,24 @@ from .database import init_db
 from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest
 from .scheduler import service as scheduler_service
 
-_LOG_FILE = Path(__file__).parent.parent.parent / "web_server.log"
+# Keep the log file inside the writable ~/.tradingagents home (override with
+# TRADINGAGENTS_LOG_DIR). The previous Path(__file__).parent.parent.parent
+# location resolved into site-packages under a pip-installed/Docker layout,
+# which the non-root runtime user cannot write to — crashing the server on
+# import with PermissionError.
+_LOG_DIR = Path(
+    os.getenv("TRADINGAGENTS_LOG_DIR", Path.home() / ".tradingagents")
+)
+_LOG_HANDLERS = [logging.StreamHandler(sys.stdout)]
+try:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    _LOG_HANDLERS.insert(0, logging.FileHandler(str(_LOG_DIR / "web_server.log"), encoding="utf-8"))
+except OSError as exc:  # pragma: no cover - degrade to stdout-only logging
+    print(f"[warn] file logging disabled ({_LOG_DIR}): {exc}", file=sys.stderr)
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.FileHandler(str(_LOG_FILE), encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=_LOG_HANDLERS,
 )
 logger = logging.getLogger("tradingagents.web")
 
