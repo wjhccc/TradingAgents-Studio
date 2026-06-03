@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import init_db
-from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, screen
+from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, screen, quality
 from .scheduler import service as scheduler_service
 
 # Keep the log file inside the writable ~/.tradingagents home (override with
@@ -70,6 +70,7 @@ app.include_router(paper.router)
 app.include_router(quote.router)
 app.include_router(backtest.router)
 app.include_router(screen.router)
+app.include_router(quality.router)
 
 
 @app.get("/api/health")

@@ -189,6 +189,7 @@ interface PaperAccount {
 interface PaperPosition {
   id: number
   ticker: string
+  name: string | null
   asset_type: string
   shares: number
   avg_cost: number
@@ -200,6 +201,7 @@ interface PaperPosition {
 interface PaperOrder {
   id: number
   ticker: string
+  name: string | null
   action: string
   shares: number
   price: number
@@ -355,6 +357,10 @@ const totalPnlPct = computed(() => {
 const positionColumns = computed(() => [
   { title: t('paper.posCols.ticker'), key: 'ticker', width: 110 },
   {
+    title: t('paper.posCols.name'), key: 'name', width: 110,
+    render(r: PaperPosition) { return r.name || '—' },
+  },
+  {
     title: t('paper.posCols.sharesCost'),
     key: 'shares',
     width: 140,
@@ -410,6 +416,7 @@ const positionColumns = computed(() => [
 const orderColumns = computed(() => [
   { title: t('paper.orderCols.time'), key: 'filled_at', width: 160, render(r: PaperOrder) { return r.filled_at.replace('T', ' ').slice(0, 19) } },
   { title: t('paper.orderCols.ticker'), key: 'ticker', width: 100 },
+  { title: t('paper.orderCols.name'), key: 'name', width: 100, render(r: PaperOrder) { return r.name || '—' } },
   {
     title: t('paper.orderCols.action'),
     key: 'action',

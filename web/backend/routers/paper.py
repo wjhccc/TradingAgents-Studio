@@ -63,6 +63,52 @@ def _price_cache_put(ticker: str, price: Optional[float]) -> None:
         _PRICE_CACHE[ticker.upper()] = (time.monotonic() + _PRICE_CACHE_TTL_SEC, price)
 
 
+# --- A-share code → name map -------------------------------------------------
+# The whole A-share name list comes from one lightweight AKShare call
+# (``stock_info_a_code_name``: ~5500 rows of code+name, no quotes), cached for
+# hours since listings rename rarely. Positions/orders only ever need a dict
+# lookup off this map, so we never fan out per-ticker name fetches.
+_NAME_MAP: dict[str, str] = {}
+_NAME_MAP_EXPIRES = 0.0
+_NAME_MAP_LOCK = threading.Lock()
+_NAME_MAP_TTL_SEC = 6 * 3600.0
+
+
+def _name_map() -> dict[str, str]:
+    """Cached ``{6-digit code: name}`` for the whole A-share market.
+
+    Best-effort: on fetch failure returns whatever is cached (possibly empty)
+    so the name column just degrades to blank rather than failing the page.
+    """
+    global _NAME_MAP_EXPIRES
+    now = time.monotonic()
+    with _NAME_MAP_LOCK:
+        if _NAME_MAP and now < _NAME_MAP_EXPIRES:
+            return _NAME_MAP
+    try:
+        import tradingagents.dataflows  # noqa: F401 — NO_PROXY bootstrap
+        import akshare as ak
+        df = ak.stock_info_a_code_name()
+        fresh = {str(c).zfill(6): str(n) for c, n in zip(df["code"], df["name"])}
+    except Exception as e:  # noqa: BLE001 — name lookup is non-essential
+        logger.warning("stock name map fetch failed (names degrade to blank): %s", e)
+        fresh = {}
+    with _NAME_MAP_LOCK:
+        if fresh:
+            _NAME_MAP.clear()
+            _NAME_MAP.update(fresh)
+            _NAME_MAP_EXPIRES = now + _NAME_MAP_TTL_SEC
+        return _NAME_MAP
+
+
+def _resolve_name(ticker: str) -> Optional[str]:
+    """Best-effort display name for a ticker; None for non-A-share / unknown."""
+    digits = re.sub(r"\D", "", ticker or "")
+    if len(digits) >= 6:
+        return _name_map().get(digits[-6:])
+    return None
+
+
 # --- helpers ---
 
 _ACTION_RE = re.compile(r"\*\*Action\*\*\s*:\s*([A-Za-z]+)", re.IGNORECASE)
@@ -232,18 +278,21 @@ async def positions():
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
     positions = await loop.run_in_executor(None, db.list_paper_positions, acct["id"])
+    # Warm the name map once off-loop; decorate() then does cheap dict lookups.
+    await loop.run_in_executor(None, _name_map)
 
     async def decorate(p):
+        name = _resolve_name(p["ticker"])
         last = await loop.run_in_executor(None, _fetch_last_price_sync, p["ticker"])
         if last is None:
-            return {**p, "last_price": None, "market_value": None,
+            return {**p, "name": name, "last_price": None, "market_value": None,
                     "pnl_amount": None, "pnl_pct": None}
         shares = float(p["shares"])
         cost = float(p["avg_cost"])
         mv = round(shares * last, 2)
         pnl = round(shares * (last - cost), 2)
         pct = round((last - cost) / cost * 100, 2) if cost else None
-        return {**p, "last_price": last, "market_value": mv,
+        return {**p, "name": name, "last_price": last, "market_value": mv,
                 "pnl_amount": pnl, "pnl_pct": pct}
 
     decorated = await asyncio.gather(*(decorate(p) for p in positions))
@@ -255,6 +304,8 @@ async def orders():
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
     items = await loop.run_in_executor(None, db.list_paper_orders, acct["id"], 200)
+    await loop.run_in_executor(None, _name_map)  # warm cache off-loop
+    items = [{**o, "name": _resolve_name(o["ticker"])} for o in items]
     return {"items": items, "total": len(items)}
 
 

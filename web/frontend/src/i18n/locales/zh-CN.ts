@@ -95,7 +95,11 @@ export default {
     degradedBody: '东方财富行情暂不可用，已切换到 {source}。该源缺少 PE/PB/市值/换手，本次仅按动量/资金流选股，估值类条件已忽略。请稍后重试以恢复完整数据。',
     history: '选股历史',
     historyEmpty: '暂无历史记录',
+    historyCount: '历史 ({n})',
     reload: '载入',
+    today: '今天',
+    yesterday: '昨天',
+    candidatesCount: '{n} 只',
     columns: {
       rank: '排名',
       name: '名称',
@@ -457,6 +461,7 @@ export default {
     resetConfirm: '确认重置',
     posCols: {
       ticker: '代码',
+      name: '名称',
       sharesCost: '持仓 × 成本',
       last: '现价',
       marketValue: '市值',
@@ -471,6 +476,7 @@ export default {
     orderCols: {
       time: '时间',
       ticker: '代码',
+      name: '名称',
       action: '方向',
       shares: '数量',
       price: '价格',

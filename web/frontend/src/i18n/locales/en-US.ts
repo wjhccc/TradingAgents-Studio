@@ -95,7 +95,11 @@ export default {
     degradedBody: 'Eastmoney is unavailable; switched to {source}. It lacks PE/PB/cap/turnover, so this screen used momentum/capital-flow only and skipped valuation filters. Retry later for full data.',
     history: 'History',
     historyEmpty: 'No history yet',
+    historyCount: 'History ({n})',
     reload: 'Load',
+    today: 'Today',
+    yesterday: 'Yesterday',
+    candidatesCount: '{n} stocks',
     columns: {
       rank: 'Rank',
       name: 'Name',
@@ -457,6 +461,7 @@ export default {
     resetConfirm: 'Confirm reset',
     posCols: {
       ticker: 'Ticker',
+      name: 'Name',
       sharesCost: 'Shares × Cost',
       last: 'Last',
       marketValue: 'Mkt value',
@@ -471,6 +476,7 @@ export default {
     orderCols: {
       time: 'Time',
       ticker: 'Ticker',
+      name: 'Name',
       action: 'Action',
       shares: 'Shares',
       price: 'Price',
