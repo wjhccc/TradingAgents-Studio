@@ -155,6 +155,45 @@ class PaperAccountReset(BaseModel):
     confirm: bool = False
 
 
+class ScreenRequest(BaseModel):
+    """Start a stock-screening ("选股") run.
+
+    ``text`` is the natural-language goal (e.g. "低估值、主力在流入的消费股").
+    ``filters`` is an optional explicit override map (pe_max, market_cap_min,
+    sector_query, ...) that wins over whatever the strategy compiler infers.
+    ``use_llm`` toggles the LLM strategy-compile + rationale layer; off ⇒
+    pure deterministic factor screening (free, no API key needed).
+    """
+    text: str = ""
+    filters: Optional[dict] = None
+    top_n: int = 20
+    use_llm: bool = True
+
+
+class ScreenToPaperRequest(BaseModel):
+    """One-click add screened tickers to the paper account as buy orders.
+
+    ``sizing`` picks how each position is sized:
+      - ``equal_cash``   — split ``value`` fraction (0..1) of account cash
+                           equally across the selected tickers (default).
+      - ``fixed_cash``   — invest ``value`` CNY into each ticker.
+      - ``fixed_shares`` — buy ``value`` shares of each ticker.
+    A-share orders are floored to whole 100-share lots.
+    """
+    tickers: list[str]
+    sizing: str = "equal_cash"
+    value: float = 0.5
+    asset_type: str = "stock"
+
+
+class ScreenToAnalyzeRequest(BaseModel):
+    """One-click push screened tickers into deep multi-agent analysis."""
+    tickers: list[str]
+    asset_type: str = "stock"
+    analysts: list[str] = ["market", "news", "fundamentals"]
+    trade_date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+
+
 class BacktestRunRequest(BaseModel):
     """Create + execute a backtest in one request.
 

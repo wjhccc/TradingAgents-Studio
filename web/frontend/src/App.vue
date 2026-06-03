@@ -56,6 +56,7 @@ import { NIcon } from 'naive-ui'
 import {
   HomeOutline,
   AddCircleOutline,
+  FunnelOutline,
   TimeOutline,
   SettingsOutline,
   ColorPaletteOutline,
@@ -101,6 +102,7 @@ function renderIcon(icon: any) {
 const menuOptions = computed(() => [
   { label: t('menu.dashboard'), key: 'dashboard', icon: renderIcon(HomeOutline) },
   { label: t('menu.analyze'), key: 'analyze', icon: renderIcon(AddCircleOutline) },
+  { label: t('menu.screener'), key: 'screener', icon: renderIcon(FunnelOutline) },
   { label: t('menu.holdings'), key: 'holdings', icon: renderIcon(WalletOutline) },
   { label: t('menu.schedule'), key: 'schedule', icon: renderIcon(AlarmOutline) },
   { label: t('menu.paper'), key: 'paper', icon: renderIcon(TrendingUpOutline) },

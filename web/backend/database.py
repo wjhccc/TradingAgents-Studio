@@ -179,6 +179,18 @@ CREATE TABLE IF NOT EXISTS backtest_nav (
     benchmark_value REAL
 );
 CREATE INDEX IF NOT EXISTS idx_backtest_nav_run ON backtest_nav(run_id, snapshot_date);
+
+CREATE TABLE IF NOT EXISTS screen_runs (
+    id              TEXT PRIMARY KEY,
+    text            TEXT,
+    strategy_json   TEXT,
+    candidates_json TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    error_msg       TEXT,
+    created_at      TEXT NOT NULL,
+    completed_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_screen_runs_created ON screen_runs(created_at DESC);
 """
 
 
@@ -284,6 +296,67 @@ def delete_analysis(id: str):
         conn.execute("DELETE FROM agent_events WHERE analysis_id = ?", (id,))
         conn.execute("DELETE FROM agent_reports WHERE analysis_id = ?", (id,))
         conn.execute("DELETE FROM analyses WHERE id = ?", (id,))
+
+
+# --- Screen runs (选股) CRUD ---
+
+def create_screen_run(id: str, text: str) -> dict:
+    now = datetime.utcnow().isoformat() + "Z"
+    with get_db() as conn:
+        conn.execute(
+            "INSERT INTO screen_runs (id, text, status, created_at) VALUES (?, ?, 'pending', ?)",
+            (id, text, now),
+        )
+    return {"id": id, "text": text, "status": "pending", "created_at": now}
+
+
+def update_screen_run(id: str, *, status: Optional[str] = None,
+                      strategy: Optional[dict] = None,
+                      candidates: Optional[list] = None,
+                      error_msg: Optional[str] = None) -> Optional[dict]:
+    sets, params = [], []
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+        if status in ("complete", "error"):
+            sets.append("completed_at = ?")
+            params.append(datetime.utcnow().isoformat() + "Z")
+    if strategy is not None:
+        sets.append("strategy_json = ?")
+        params.append(json.dumps(strategy, ensure_ascii=False))
+    if candidates is not None:
+        sets.append("candidates_json = ?")
+        params.append(json.dumps(candidates, ensure_ascii=False))
+    if error_msg is not None:
+        sets.append("error_msg = ?")
+        params.append(error_msg)
+    if not sets:
+        return get_screen_run(id)
+    params.append(id)
+    with get_db() as conn:
+        conn.execute(f"UPDATE screen_runs SET {', '.join(sets)} WHERE id = ?", params)
+    return get_screen_run(id)
+
+
+def get_screen_run(id: str) -> Optional[dict]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM screen_runs WHERE id = ?", (id,)).fetchone()
+    if not row:
+        return None
+    d = dict(row)
+    d["strategy"] = json.loads(d.pop("strategy_json") or "null")
+    d["candidates"] = json.loads(d.pop("candidates_json") or "[]")
+    return d
+
+
+def list_screen_runs(limit: int = 50) -> list:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id, text, status, created_at, completed_at FROM screen_runs "
+            "ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_dashboard_stats() -> dict:

@@ -14,7 +14,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from .database import init_db
-from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest
+from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, screen
 from .scheduler import service as scheduler_service
 
 # Keep the log file inside the writable ~/.tradingagents home (override with
@@ -69,6 +69,7 @@ app.include_router(schedule.router)
 app.include_router(paper.router)
 app.include_router(quote.router)
 app.include_router(backtest.router)
+app.include_router(screen.router)
 
 
 @app.get("/api/health")
@@ -95,6 +96,37 @@ async def ws_analyze(websocket: WebSocket, analysis_id: str):
             event = await queue.get()
             await websocket.send_json(event)
             if event.get("type") in ("analysis_complete", "error"):
+                break
+    except WebSocketDisconnect:
+        pass
+
+
+@app.websocket("/ws/screen/{run_id}")
+async def ws_screen(websocket: WebSocket, run_id: str):
+    await websocket.accept()
+    from .routers.screen import _active_queues
+    from . import database as db
+
+    queue = _active_queues.get(run_id)
+    if not queue:
+        # Run already finished (or unknown) — replay the stored result so a
+        # late-connecting client still gets the candidates, then close.
+        run = db.get_screen_run(run_id)
+        if run:
+            await websocket.send_json({
+                "type": "screen_complete" if run["status"] == "complete" else run["status"],
+                "agent": "screener",
+                "strategy": run.get("strategy"),
+                "candidates": run.get("candidates", []),
+            })
+        await websocket.close()
+        return
+
+    try:
+        while True:
+            event = await queue.get()
+            await websocket.send_json(event)
+            if event.get("type") in ("screen_complete", "error"):
                 break
     except WebSocketDisconnect:
         pass
