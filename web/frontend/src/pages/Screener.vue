@@ -27,7 +27,9 @@
         <n-text depth="3">{{ t('screener.momentumPeriod') }}:</n-text>
         <n-select v-model:value="momentumPeriod" :options="periodOptions" size="small" style="width: 150px" />
         <n-select v-model:value="momentumDirection" :options="directionOptions" size="small" style="width: 160px" />
-        <n-button text size="small" @click="openHistory">{{ t('screener.history') }}</n-button>
+        <n-button size="small" secondary type="info" @click="openHistory">
+          📋 {{ historyItems.length ? t('screener.historyCount', { n: historyItems.length }) : t('screener.history') }}
+        </n-button>
       </n-space>
 
       <!-- Advanced filters -->
@@ -130,11 +132,14 @@
         <n-empty v-if="!historyItems.length" :description="t('screener.historyEmpty')" />
         <n-list v-else hoverable clickable>
           <n-list-item v-for="h in historyItems" :key="h.id" @click="loadHistory(h.id)">
-            <n-thing :title="h.text || '(默认因子)'">
+            <n-thing :title="h.text || t('screener.noData')">
+              <template #header-extra>
+                <n-tag v-if="h.id === runId" size="tiny" type="info" :bordered="false">●</n-tag>
+              </template>
               <template #description>
                 <n-space :size="6" align="center">
-                  <n-tag size="tiny" :bordered="false" :type="h.status === 'complete' ? 'success' : 'default'">{{ h.status }}</n-tag>
-                  <n-text depth="3" style="font-size: 12px">{{ h.created_at }}</n-text>
+                  <n-text strong style="font-size: 12px">{{ fmtTime(h.created_at) }}</n-text>
+                  <n-tag size="tiny" :bordered="false" :type="h.status === 'complete' ? 'success' : (h.status === 'error' ? 'error' : 'default')">{{ h.status }}</n-tag>
                 </n-space>
               </template>
             </n-thing>
@@ -146,7 +151,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, h, watch } from 'vue'
+import { ref, reactive, computed, h, watch, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { NText, NTag, NTooltip, NSpace, useMessage } from 'naive-ui'
@@ -190,6 +195,10 @@ const checkedKeys = ref<(string | number)[]>([])
 const strategyLabels = computed<string[]>(() => strategy.value?.provenance?.labels || strategy.value?.labels || [])
 
 let ws: WebSocket | null = null
+
+// Key under which we stash the last completed run id, so a refresh can
+// restore the last screen result instead of showing an empty table.
+const LAST_RUN_KEY = 'screener:lastRunId'
 
 function cleanFilters(): Record<string, any> {
   const out: Record<string, any> = {}
@@ -242,6 +251,10 @@ function connect(id: string) {
       candidates.value = ev.candidates || []
       running.value = false
       progressMsg.value = ''
+      // Remember this run so a page refresh / nav-away restores it (results
+      // are already persisted server-side; we only need the id to re-fetch).
+      if (runId.value) localStorage.setItem(LAST_RUN_KEY, runId.value)
+      refreshHistory()  // pull the new run into the history list + count
       ws?.close()
     } else if (ev.type === 'error') {
       running.value = false
@@ -256,6 +269,22 @@ function connect(id: string) {
 
 function fmt(v: any, digits = 2): string {
   return v == null ? '-' : Number(v).toFixed(digits)
+}
+
+// Render a UTC ISO timestamp as a readable local time, tagged 今天/昨天 so
+// the user can tell yesterday's screen from today's at a glance.
+function fmtTime(iso: string): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (isNaN(d.getTime())) return iso
+  const now = new Date()
+  const sameDay = (a: Date, b: Date) =>
+    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+  const yest = new Date(now); yest.setDate(now.getDate() - 1)
+  const hm = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  if (sameDay(d, now)) return `${t('screener.today')} ${hm}`
+  if (sameDay(d, yest)) return `${t('screener.yesterday')} ${hm}`
+  return `${d.toLocaleDateString([], { year: 'numeric', month: '2-digit', day: '2-digit' })} ${hm}`
 }
 
 const columns = computed<any[]>(() => [
@@ -372,20 +401,27 @@ async function batchAnalyze() {
 const showHistory = ref(false)
 const historyItems = ref<any[]>([])
 
-async function openHistory() {
-  showHistory.value = true
+// Fetch the list of past runs (server-persisted, newest first). Used both to
+// populate the drawer and to keep the history-button count current.
+async function refreshHistory() {
   try {
     const { data } = await api.get('/api/screen')
     historyItems.value = data.items || []
-  } catch (e: any) {
-    message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
+  } catch {
+    /* non-fatal: history list is best-effort */
   }
 }
 
-async function loadHistory(id: string) {
+function openHistory() {
+  showHistory.value = true
+  refreshHistory()
+}
+
+async function loadHistory(id: string, opts: { silent?: boolean } = {}) {
   try {
     const { data } = await api.get(`/api/screen/${id}`)
     runId.value = data.id
+    goal.value = data.text || ''
     strategy.value = data.strategy
     candidates.value = data.candidates || []
     checkedKeys.value = []
@@ -393,8 +429,20 @@ async function loadHistory(id: string) {
     progressMsg.value = ''
     degraded.value = (data.strategy?.provenance && data.strategy.coverage === 'partial') || false
     showHistory.value = false
+    localStorage.setItem(LAST_RUN_KEY, data.id)
   } catch (e: any) {
+    // On auto-restore a stale/deleted id just clears silently — no error toast.
+    if (opts.silent) { localStorage.removeItem(LAST_RUN_KEY); return }
     message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
   }
 }
+
+// On mount: load the history list (so the button shows a count) and restore
+// the last viewed run, so switching tabs away and back — or a full refresh —
+// doesn't wipe what the user was looking at.
+onMounted(() => {
+  refreshHistory()
+  const last = localStorage.getItem(LAST_RUN_KEY)
+  if (last) loadHistory(last, { silent: true })
+})
 </script>
