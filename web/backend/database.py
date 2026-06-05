@@ -298,6 +298,31 @@ def delete_analysis(id: str):
         conn.execute("DELETE FROM analyses WHERE id = ?", (id,))
 
 
+def fail_stale_runs() -> int:
+    """Mark interrupted analyses / screen runs as failed on startup.
+
+    A process kill (crash, reload, Ctrl-C) leaves rows stuck in
+    'pending'/'running' forever — their in-memory runner is gone but the DB
+    still says they're live. We reconcile that at boot so the history/screener
+    views don't show ghost runs the user then can't get rid of. Returns the
+    number of rows reconciled.
+    """
+    now = datetime.utcnow().isoformat() + "Z"
+    msg = "中断（服务重启）"
+    with get_db() as conn:
+        a = conn.execute(
+            "UPDATE analyses SET status = 'failed', error_msg = ?, completed_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (msg, now),
+        )
+        s = conn.execute(
+            "UPDATE screen_runs SET status = 'error', error_msg = ?, completed_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (msg, now),
+        )
+    return (a.rowcount or 0) + (s.rowcount or 0)
+
+
 # --- Screen runs (选股) CRUD ---
 
 def create_screen_run(id: str, text: str) -> dict:
@@ -357,6 +382,13 @@ def list_screen_runs(limit: int = 50) -> list:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def delete_screen_run(id: str) -> bool:
+    """Delete one screen run. Returns True if a row was removed."""
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM screen_runs WHERE id = ?", (id,))
+    return cur.rowcount > 0
 
 
 def get_dashboard_stats() -> dict:
@@ -661,9 +693,14 @@ def list_paper_accounts() -> list:
     return [dict(r) for r in rows]
 
 
-def reset_paper_account(account_id: int) -> Optional[dict]:
-    """Wipe positions + orders + nav snapshots for an account and reset cash
-    to initial_cash. Used when the user wants to start a fresh simulation."""
+def reset_paper_account(account_id: int,
+                        initial_cash: Optional[float] = None) -> Optional[dict]:
+    """Wipe positions + orders + nav snapshots for an account and reset cash.
+
+    With ``initial_cash`` (>0) the account's starting capital (本金) is changed
+    to that value and cash reset to it — lets the user run a small book (e.g.
+    ¥10,000). Without it, the existing ``initial_cash`` is reused. Used when the
+    user wants to start a fresh simulation."""
     now = datetime.utcnow().isoformat() + "Z"
     with get_db() as conn:
         row = conn.execute(
@@ -671,12 +708,14 @@ def reset_paper_account(account_id: int) -> Optional[dict]:
         ).fetchone()
         if not row:
             return None
+        new_cash = (float(initial_cash) if initial_cash is not None and initial_cash > 0
+                    else row["initial_cash"])
         conn.execute("DELETE FROM paper_positions WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM paper_orders WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM paper_nav WHERE account_id = ?", (account_id,))
         conn.execute(
-            "UPDATE paper_accounts SET cash = ?, updated_at = ? WHERE id = ?",
-            (row["initial_cash"], now, account_id),
+            "UPDATE paper_accounts SET initial_cash = ?, cash = ?, updated_at = ? WHERE id = ?",
+            (new_cash, new_cash, now, account_id),
         )
     return get_paper_account(account_id)
 

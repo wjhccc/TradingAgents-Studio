@@ -153,6 +153,10 @@ class PaperOrderFromDecision(BaseModel):
 
 class PaperAccountReset(BaseModel):
     confirm: bool = False
+    # Optional new starting capital (本金). When set (>0), the account's
+    # initial_cash is updated to this and cash reset to it; when omitted, the
+    # existing initial_cash is reused. Lets the user run with, say, ¥10,000.
+    initial_cash: Optional[float] = None
 
 
 class ScreenRequest(BaseModel):

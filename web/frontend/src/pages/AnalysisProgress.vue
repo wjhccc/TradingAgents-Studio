@@ -73,6 +73,7 @@ import { useI18n } from 'vue-i18n'
 import { useRoute } from 'vue-router'
 import { useNotification } from 'naive-ui'
 import DebateThread from '../components/DebateThread.vue'
+import { formatTime } from '../utils/datetime'
 
 const { t } = useI18n()
 const route = useRoute()
@@ -144,9 +145,6 @@ function timelineContent(ev: AgentEvent): string {
   return txt.length > 200 ? txt.slice(0, 200) + '…' : txt
 }
 
-function formatTime(ts: string) {
-  return new Date(ts).toLocaleTimeString()
-}
 
 function connect() {
   const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/analyze/${analysisId}`

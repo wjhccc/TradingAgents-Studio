@@ -5,9 +5,9 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.default_config import DEFAULT_CONFIG
 
 from . import database as db
+from .executors import heavy_executor, analysis_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -231,16 +231,26 @@ class GraphRunner:
         return None
 
     async def run(self) -> Optional[tuple]:
-        """Run analysis in a thread pool, streaming node events via the queue."""
+        """Run analysis, streaming node events via the queue.
+
+        Gated by ``analysis_semaphore`` and executed on the dedicated
+        ``heavy_executor`` so concurrent/batch runs queue here instead of
+        pinning the default executor and freezing the request path. A queued
+        run stays ``pending`` until a slot frees.
+        """
+        self._loop = asyncio.get_running_loop()
+        async with analysis_semaphore():
+            return await self._run_guarded()
+
+    async def _run_guarded(self) -> Optional[tuple]:
         ticker = self.config["_ticker"]
         trade_date = self.config["_trade_date"]
 
         db.update_analysis_status(self.analysis_id, "running")
         await self._emit("agent_start", "system", f"Starting analysis for {ticker} on {trade_date}")
 
-        self._loop = asyncio.get_running_loop()
         try:
-            final_state, signal = await self._loop.run_in_executor(None, self._run_sync)
+            final_state, signal = await self._loop.run_in_executor(heavy_executor, self._run_sync)
 
             # Extract and store reports
             for key, (agent_name, report_type) in _REPORT_KEYS.items():
@@ -310,8 +320,19 @@ def _extract_signal_direction(signal: str) -> str:
 
 
 def build_config(req) -> dict:
-    """Build a config dict from an AnalyzeRequest, merging with defaults."""
-    config = DEFAULT_CONFIG.copy()
+    """Build a config dict from an AnalyzeRequest, merging with effective config.
+
+    Base is ``get_effective_config()`` — DEFAULT_CONFIG plus the in-memory
+    overrides the settings page applies at runtime — NOT a bare
+    ``DEFAULT_CONFIG.copy()``. DEFAULT_CONFIG is a snapshot frozen at process
+    import, so it misses a provider/model the user switched to after startup;
+    using it here meant the LLM pre-flight (which reads the effective config)
+    passed on deepseek while the graph was built on stale openai and failed.
+    Explicit request fields still win over both.
+    """
+    from .routers.settings import get_effective_config
+
+    config = dict(get_effective_config())
     if req.llm_provider:
         config["llm_provider"] = req.llm_provider
     if req.deep_think_llm:

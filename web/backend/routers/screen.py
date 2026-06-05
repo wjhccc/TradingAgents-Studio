@@ -66,6 +66,16 @@ async def get_screen(run_id: str):
     return run
 
 
+@router.delete("/{run_id}")
+async def delete_screen(run_id: str):
+    """Delete a screen run from history."""
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(None, db.delete_screen_run, run_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="选股记录不存在")
+    return {"ok": True}
+
+
 def _floor_lot(ticker: str, shares: float) -> float:
     """A-share orders trade in 100-share lots — floor to a whole lot."""
     if db._is_a_share_ticker(ticker):
@@ -141,6 +151,13 @@ async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
         raise HTTPException(status_code=400, detail="未选择任何股票")
     trade_date = req.trade_date or datetime.now().strftime("%Y-%m-%d")
     loop = asyncio.get_running_loop()
+
+    # Each ticker spawns a deep analysis that hard-requires an LLM. Check once
+    # up front so a missing key returns 400 instead of starting N doomed runs.
+    from ..llm_health import check_llm_ready
+    err = await loop.run_in_executor(None, check_llm_ready)
+    if err:
+        raise HTTPException(status_code=400, detail=f"LLM 未就绪，无法启动分析：{err}")
 
     started = []
     for ticker in req.tickers:

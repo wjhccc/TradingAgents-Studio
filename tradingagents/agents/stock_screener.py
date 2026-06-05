@@ -48,6 +48,10 @@ _PERIOD_KW: dict[str, str] = {
     "两月": "60d", "60日": "60d", "三个月": "60d", "季度": "60d", "一季": "60d",
     "年初至今": "ytd", "今年以来": "ytd", "年内": "ytd", "今年": "ytd",
 }
+_MAINBOARD_KW = ("无门槛", "主板", "沪深主板", "不要创业板", "不要科创板",
+                 "不要北交所", "不要科创", "无需开通", "普通账户")
+_BUYABLE_KW = ("可买入", "能买", "能买入", "可买", "排除涨停", "非涨停", "未涨停",
+               "可介入", "可上车", "低吸", "有买点")
 _SMALL_KW = ("小市值", "小盘", "中小盘", "微盘")
 _LARGE_KW = ("大市值", "大盘", "白马", "蓝筹", "权重")
 
@@ -142,6 +146,14 @@ def _compile_with_rules(text: str) -> tuple[StrategySpec, list[str], int]:
     if has(_FLOW_KW):
         weights["capital_flow"] += 1.5
         labels.append("主力资金流入")
+        hits += 1
+    if has(_MAINBOARD_KW):
+        spec.main_board_only = True
+        labels.append("无门槛(沪深主板)")
+        hits += 1
+    if has(_BUYABLE_KW):
+        spec.buyable_only = True
+        labels.append("只看可买入")
         hits += 1
     if has(_SMALL_KW):
         spec.market_cap_max = 100.0  # 亿元
@@ -283,18 +295,25 @@ def _rank_with_llm(candidates: list[dict], goal: str, llm) -> list[dict]:
     rows = []
     for c in candidates:
         m = c.get("metrics", {})
+        sig = c.get("signal", {})
         rows.append({
             "ticker": c["ticker"], "name": c.get("name"),
             "price": m.get("price"), "change_pct": m.get("change_pct"),
             "pe": m.get("pe"), "pb": m.get("pb"),
             "market_cap_yi": m.get("market_cap"), "turnover": m.get("turnover"),
             "main_net_inflow": m.get("main_net_inflow"), "score": c.get("score"),
+            # The deterministic buy-timing verdict — the LLM must stay consistent
+            # with it (e.g. never say "可买入" on a 涨停封板·明日难追 name).
+            "action": sig.get("action"), "buyable": sig.get("buyable"),
         })
     prompt = (
         "你是A股选股分析师。下面是已经按量化因子筛选并打分的候选股票(数据真实，来自行情接口)。\n"
         f"用户的选股目标是: {goal or '(未指定，按综合因子)'}\n\n"
-        "请只依据给定数据，为每只股票写一句中文入选理由和一句风险提示。"
-        "不要编造任何数据，不要新增表中没有的股票。\n\n"
+        "每只股票已附带一个确定性的『操作建议』(action/buyable)，由板块涨跌停、"
+        "涨幅透支度、换手与资金流推导得出。请只依据给定数据，为每只股票写一句中文"
+        "入选理由和一句风险提示，且必须与 action/buyable 保持一致——"
+        "对 buyable=false 的票不要写出鼓励买入的措辞，应点明为何当前不宜追(如已涨停、"
+        "高位透支、量能不足、资金流出等)。不要编造任何数据，不要新增表中没有的股票。\n\n"
         f"候选(JSON): {json.dumps(rows, ensure_ascii=False)}\n\n"
         'Return ONLY a JSON array: [{"ticker":"600519","reason":"...","risk":"..."}]'
     )

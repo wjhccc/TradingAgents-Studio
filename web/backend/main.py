@@ -13,7 +13,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from .database import init_db
+from .database import init_db, fail_stale_runs
+from .executors import shutdown as shutdown_heavy_executor
 from .routers import analyze, history, dashboard, settings, holdings, schedule, paper, quote, backtest, screen, quality
 from .scheduler import service as scheduler_service
 
@@ -43,11 +44,17 @@ logger = logging.getLogger("tradingagents.web")
 async def lifespan(app):
     logger.info("Server starting up, initializing database...")
     init_db()
+    # Reconcile runs left 'pending'/'running' by a previous crash/reload so the
+    # UI doesn't show ghost rows the user can't delete.
+    stale = fail_stale_runs()
+    if stale:
+        logger.info("Reconciled %d interrupted run(s) to failed.", stale)
     await scheduler_service.start()
     logger.info("Database initialized. Server ready.")
     yield
     logger.info("Server shutting down.")
     await scheduler_service.stop()
+    shutdown_heavy_executor()
 
 
 app = FastAPI(title="TradingAgents Web", version="0.1.0", lifespan=lifespan)
