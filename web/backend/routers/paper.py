@@ -393,23 +393,30 @@ async def take_snapshot():
     """
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
-    positions = await loop.run_in_executor(None, db.list_paper_positions, acct["id"])
+    return await loop.run_in_executor(
+        None, compute_and_store_nav_snapshot, acct["id"],
+    )
 
+
+def compute_and_store_nav_snapshot(account_id: int) -> dict:
+    """Mark-to-market every open position and upsert today's NAV row.
+
+    Synchronous so it can be called from both the HTTP handler (via
+    run_in_executor) and the background scheduler's daily auto-snapshot.
+    Quote failures fall back to cost basis so the snapshot never goes NaN.
+    """
+    acct = db.get_paper_account(account_id) or db.ensure_default_paper_account()
+    positions = db.list_paper_positions(acct["id"])
     positions_value = 0.0
     for p in positions:
-        last = await loop.run_in_executor(None, _fetch_last_price_sync, p["ticker"])
+        last = _fetch_last_price_sync(p["ticker"])
         if last is None:
-            # Fall back to cost basis when quote fails so the snapshot
-            # doesn't become zero / NaN.
             positions_value += float(p["shares"]) * float(p["avg_cost"])
         else:
             positions_value += float(p["shares"]) * last
     snapshot_date = datetime.now().strftime("%Y-%m-%d")
-    await loop.run_in_executor(
-        None,
-        lambda: db.upsert_paper_nav(
-            acct["id"], snapshot_date, acct["cash"], round(positions_value, 2),
-        ),
+    db.upsert_paper_nav(
+        acct["id"], snapshot_date, acct["cash"], round(positions_value, 2),
     )
     return {
         "snapshot_date": snapshot_date,
@@ -417,3 +424,92 @@ async def take_snapshot():
         "positions_value": round(positions_value, 2),
         "total_value": round(acct["cash"] + positions_value, 2),
     }
+
+
+def execute_auto_trade(
+    analysis_id: str,
+    *,
+    cash_fraction: float = 0.1,
+    skip_if_held: bool = True,
+) -> tuple[Optional[dict], str]:
+    """Turn a completed analysis's decision into a paper order automatically.
+
+    Designed to be called from the scheduler after a scheduled analysis
+    completes. Synchronous and **never raises** — any problem is returned
+    as a human-readable reason string so a failure can't take down the
+    scheduler tick. Returns ``(order_or_None, reason)``.
+
+    Trading rules (per the auto-trade product spec):
+      - BUY  + not held  → buy ``cash_fraction`` of available cash
+      - BUY  + already held → skip (no pyramiding) when ``skip_if_held``
+      - SELL + held      → flatten the whole position
+      - SELL + not held  → skip
+      - HOLD / no action → skip
+
+    Reuses the same decision-card parser, price helper, and broker call as
+    the manual ``order_from_decision`` endpoint.
+    """
+    try:
+        analysis = db.get_analysis(analysis_id)
+        if not analysis:
+            return None, "分析记录不存在"
+        if analysis.get("status") != "complete":
+            return None, "分析尚未完成，跳过自动交易"
+
+        reports = db.get_agent_reports(analysis_id)
+        parsed = _parse_decision_card(reports, analysis.get("final_decision") or "")
+        action = parsed["action"]
+        if action not in ("buy", "sell"):
+            return None, f"决策为 {action or 'Hold'}，不产生订单"
+
+        ticker = analysis["ticker"]
+        acct = db.ensure_default_paper_account()
+        positions = db.list_paper_positions(acct["id"])
+        pos = next((p for p in positions if p["ticker"] == ticker.upper()), None)
+
+        price = parsed.get("entry_price")
+        if price is None or price <= 0:
+            price = _fetch_last_price_sync(ticker)
+        if price is None or price <= 0:
+            return None, "无法获取价格，跳过自动交易"
+        price = float(price)
+
+        if action == "buy":
+            if pos and skip_if_held:
+                return None, f"{ticker} 已持仓，不加仓"
+            frac = max(0.0, min(1.0, float(cash_fraction)))
+            shares = (acct["cash"] * frac) / price
+            if db._is_a_share_ticker(ticker):
+                shares = int(shares // 100) * 100  # whole 100-share lots
+            else:
+                shares = round(shares, 2)
+            if shares <= 0:
+                return None, "可用现金不足以买入 1 手，跳过"
+        else:  # sell
+            if not pos:
+                return None, f"{ticker} 无持仓可卖，跳过"
+            shares = float(pos["shares"])
+
+        notes_parts = [f"自动交易 · 来源 {analysis_id[:8]}"]
+        if parsed.get("target_price"):
+            notes_parts.append(f"目标 {parsed['target_price']}")
+        if parsed.get("stop_loss"):
+            notes_parts.append(f"止损 {parsed['stop_loss']}")
+
+        order, err = db.place_paper_order(
+            account_id=acct["id"],
+            ticker=ticker,
+            asset_type=analysis.get("asset_type", "stock"),
+            action=action,
+            shares=shares,
+            price=price,
+            source="auto",
+            source_analysis_id=analysis_id,
+            notes=" / ".join(notes_parts),
+        )
+        if err:
+            return None, err
+        return order, f"{action} {shares} {ticker} @ {price}"
+    except Exception as e:  # belt-and-braces: scheduler must not crash
+        logger.exception("auto-trade failed for analysis %s", analysis_id)
+        return None, f"自动交易异常: {e}"

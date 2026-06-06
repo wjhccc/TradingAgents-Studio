@@ -20,7 +20,10 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from .. import database as db
-from ..models import ScreenRequest, ScreenToPaperRequest, ScreenToAnalyzeRequest
+from ..models import (
+    ScreenRequest, ScreenToPaperRequest, ScreenToAnalyzeRequest,
+    ScreenToScheduleRequest,
+)
 from ..screener_runner import ScreenerRunner
 
 router = APIRouter(prefix="/api/screen", tags=["screen"])
@@ -161,3 +164,61 @@ async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
         started.append({"ticker": ticker, "analysis_id": analysis_id})
 
     return {"started": started, "total": len(started)}
+
+
+@router.post("/{run_id}/to-schedule")
+async def screen_to_schedule(run_id: str, req: ScreenToScheduleRequest):
+    """Turn the selected tickers into a daily auto-trading portfolio.
+
+    Creates one daily schedule per ticker with ``auto_trade`` on, so each
+    runs an analysis every day and places a paper order from the decision.
+    Tickers that already have an active schedule are skipped (no dupes),
+    mirroring ``schedule.bulk_from_holdings``.
+    """
+    from ..scheduler import compute_next_run_at
+
+    if not req.tickers:
+        raise HTTPException(status_code=400, detail="未选择任何股票")
+    loop = asyncio.get_running_loop()
+    existing = await loop.run_in_executor(None, db.list_schedules, None)
+    active_tickers = {
+        s["ticker"].upper() for s in existing if s["status"] != "disabled"
+    }
+    next_run = compute_next_run_at("daily", None, req.time_of_day, None)
+    config = {
+        "max_debate_rounds": req.max_debate_rounds,
+        "max_risk_discuss_rounds": req.max_risk_discuss_rounds,
+        "llm_provider": None,
+        "deep_think_llm": None,
+        "quick_think_llm": None,
+        "output_language": "Chinese",
+        "checkpoint_enabled": False,
+    }
+    created = 0
+    skipped = []
+    for ticker in req.tickers:
+        t = ticker.strip().upper()
+        if t in active_tickers:
+            skipped.append(t)
+            continue
+        await loop.run_in_executor(
+            None,
+            lambda t=t: db.create_schedule(
+                name=f"自动交易: {t}",
+                ticker=t,
+                asset_type=req.asset_type,
+                schedule_type="daily",
+                interval_minutes=None,
+                time_of_day=req.time_of_day,
+                day_of_week=None,
+                analysts=req.analysts,
+                config=config,
+                next_run_at=next_run,
+                from_holding=False,
+                auto_trade=req.auto_trade,
+                auto_trade_cash_fraction=req.auto_trade_cash_fraction,
+            ),
+        )
+        active_tickers.add(t)
+        created += 1
+    return {"created": created, "skipped": skipped}

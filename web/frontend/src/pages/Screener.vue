@@ -85,6 +85,9 @@
           <n-button size="small" @click="batchAnalyze" :loading="analyzing">
             {{ t('screener.batchAnalyze') }}
           </n-button>
+          <n-button size="small" type="warning" @click="batchAutoTrade" :loading="addingSchedule">
+            {{ t('screener.toSchedule') }}
+          </n-button>
         </n-space>
       </template>
 
@@ -367,8 +370,26 @@ async function batchAnalyze() {
   }
 }
 
-// --- history ---
+// --- batch auto-trade portfolio ---
 
+const addingSchedule = ref(false)
+async function batchAutoTrade() {
+  if (!checkedKeys.value.length) { message.warning(t('screener.emptySelect')); return }
+  addingSchedule.value = true
+  try {
+    const { data } = await api.post(`/api/screen/${runId.value}/to-schedule`, {
+      tickers: checkedKeys.value,
+    })
+    message.success(t('screener.toScheduleDone', { created: data.created, skipped: data.skipped.length }))
+    router.push('/schedule')
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
+  } finally {
+    addingSchedule.value = false
+  }
+}
+
+// --- history ---
 const showHistory = ref(false)
 const historyItems = ref<any[]>([])
 

@@ -94,6 +94,11 @@ class ScheduleCreate(BaseModel):
     deep_think_llm: Optional[str] = None
     quick_think_llm: Optional[str] = None
     output_language: Optional[str] = None
+    # When True, after each scheduled analysis completes the engine places a
+    # paper-trading order from its decision (BUY→buy if not held, SELL→flatten).
+    auto_trade: bool = False
+    # Fraction of available cash to spend per BUY signal (0..1). None ⇒ 0.1.
+    auto_trade_cash_fraction: Optional[float] = 0.1
 
 
 class ScheduleUpdate(BaseModel):
@@ -104,6 +109,8 @@ class ScheduleUpdate(BaseModel):
     day_of_week: Optional[int] = None
     analysts: Optional[list[str]] = None
     status: Optional[str] = None  # 'active' | 'paused' | 'disabled'
+    auto_trade: Optional[bool] = None
+    auto_trade_cash_fraction: Optional[float] = None
 
 
 class ScheduleFromHoldings(BaseModel):
@@ -115,6 +122,8 @@ class ScheduleFromHoldings(BaseModel):
     analysts: list[str] = ["market", "news", "fundamentals"]
     max_debate_rounds: int = 1
     max_risk_discuss_rounds: int = 1
+    auto_trade: bool = False
+    auto_trade_cash_fraction: Optional[float] = 0.1
 
 
 class PaperOrderRequest(BaseModel):
@@ -192,6 +201,23 @@ class ScreenToAnalyzeRequest(BaseModel):
     asset_type: str = "stock"
     analysts: list[str] = ["market", "news", "fundamentals"]
     trade_date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+
+
+class ScreenToScheduleRequest(BaseModel):
+    """One-click turn screened tickers into a daily auto-trading portfolio.
+
+    Creates one daily schedule per ticker with ``auto_trade`` on, so each
+    one runs an analysis every day and places a paper order from the
+    decision. Tickers that already have an active schedule are skipped.
+    """
+    tickers: list[str]
+    asset_type: str = "stock"
+    analysts: list[str] = ["market", "news", "fundamentals"]
+    time_of_day: str = "09:30"
+    auto_trade: bool = True
+    auto_trade_cash_fraction: Optional[float] = 0.1
+    max_debate_rounds: int = 1
+    max_risk_discuss_rounds: int = 1
 
 
 class BacktestRunRequest(BaseModel):

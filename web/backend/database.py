@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS schedules (
     last_analysis_id TEXT,
     next_run_at      TEXT NOT NULL,
     from_holding     INTEGER NOT NULL DEFAULT 0,
+    auto_trade       INTEGER NOT NULL DEFAULT 0,
+    auto_trade_cash_fraction REAL,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -212,9 +214,23 @@ def get_db():
         conn.close()
 
 
+def _add_column_if_missing(conn, table: str, col: str, ddl: str):
+    """Idempotent ALTER TABLE — adds ``col`` to ``table`` if absent.
+
+    The base schema only CREATEs tables IF NOT EXISTS, so columns added to
+    an existing DB need an explicit migration. Safe to run on every startup.
+    """
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+
 def init_db():
     with get_db() as conn:
         conn.executescript(_SCHEMA)
+        # Migrations for columns added after a DB was first created.
+        _add_column_if_missing(conn, "schedules", "auto_trade", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "schedules", "auto_trade_cash_fraction", "REAL")
 
 
 # --- Analyses CRUD ---
@@ -513,17 +529,21 @@ def create_schedule(
     config: dict,
     next_run_at: str,
     from_holding: bool = False,
+    auto_trade: bool = False,
+    auto_trade_cash_fraction: Optional[float] = None,
 ) -> dict:
     now = datetime.utcnow().isoformat() + "Z"
     with get_db() as conn:
         cur = conn.execute(
             "INSERT INTO schedules (name, ticker, asset_type, schedule_type, "
             "interval_minutes, time_of_day, day_of_week, analysts, config_json, "
-            "next_run_at, from_holding, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "next_run_at, from_holding, auto_trade, auto_trade_cash_fraction, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, ticker, asset_type, schedule_type, interval_minutes, time_of_day,
              day_of_week, json.dumps(analysts), json.dumps(config), next_run_at,
-             1 if from_holding else 0, now, now),
+             1 if from_holding else 0, 1 if auto_trade else 0,
+             auto_trade_cash_fraction, now, now),
         )
         sid = cur.lastrowid
         row = conn.execute("SELECT * FROM schedules WHERE id = ?", (sid,)).fetchone()
@@ -557,12 +577,14 @@ def update_schedule(schedule_id: int, **fields) -> Optional[dict]:
     allowed = {
         "name", "schedule_type", "interval_minutes", "time_of_day", "day_of_week",
         "analysts", "config_json", "status", "next_run_at", "last_run_at",
-        "last_analysis_id", "fail_count",
+        "last_analysis_id", "fail_count", "auto_trade", "auto_trade_cash_fraction",
     }
     cols, vals = [], []
     for k, v in fields.items():
         if k not in allowed or v is None:
             continue
+        if k == "auto_trade":
+            v = 1 if v else 0
         cols.append(f"{k} = ?")
         vals.append(json.dumps(v) if k in ("analysts",) and isinstance(v, list) else v)
     if not cols:

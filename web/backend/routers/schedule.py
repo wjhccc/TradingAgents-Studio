@@ -90,6 +90,8 @@ async def create(req: ScheduleCreate):
             config=_config_from_create(req),
             next_run_at=next_run,
             from_holding=False,
+            auto_trade=req.auto_trade,
+            auto_trade_cash_fraction=req.auto_trade_cash_fraction,
         ),
     )
     return row
@@ -196,6 +198,8 @@ async def bulk_from_holdings(req: ScheduleFromHoldings):
                 config=config,
                 next_run_at=next_run,
                 from_holding=True,
+                auto_trade=req.auto_trade,
+                auto_trade_cash_fraction=req.auto_trade_cash_fraction,
             ),
         )
         created += 1

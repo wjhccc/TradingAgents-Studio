@@ -39,6 +39,11 @@ _AUTO_DISABLE_AFTER = 3
 # a multi-day server outage we shouldn't flood the LLM with backfill).
 _MAX_CATCH_UP_SECONDS = 24 * 3600
 
+# Once per day, after this server-local time, the scheduler marks the paper
+# account to market and stores a NAV snapshot so the equity curve updates
+# without anyone clicking the manual button. 15:05 ≈ just after A-share close.
+_NAV_SNAPSHOT_AFTER_HHMM = (15, 5)
+
 
 def _now_iso() -> str:
     """Server-local ISO timestamp (no timezone marker)."""
@@ -119,6 +124,9 @@ class SchedulerService:
         # Schedule IDs currently being processed, so we don't double-fire if
         # a run lasts longer than the next tick.
         self._in_flight: set[int] = set()
+        # Last date (YYYY-MM-DD, server-local) we stored a NAV snapshot, so the
+        # daily auto-snapshot fires at most once per calendar day.
+        self._last_nav_date: Optional[str] = None
 
     async def start(self):
         if self._task and not self._task.done():
@@ -192,6 +200,28 @@ class SchedulerService:
             self._in_flight.add(sid)
             asyncio.create_task(self._fire_scheduled(s))
 
+        # Daily NAV snapshot — once per day, after market close, so the paper
+        # account's equity curve updates on its own.
+        await self._maybe_snapshot_nav(now)
+
+    async def _maybe_snapshot_nav(self, now: datetime):
+        today = now.strftime("%Y-%m-%d")
+        if self._last_nav_date == today:
+            return
+        if (now.hour, now.minute) < _NAV_SNAPSHOT_AFTER_HHMM:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            from .routers.paper import compute_and_store_nav_snapshot
+            acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
+            snap = await loop.run_in_executor(
+                None, compute_and_store_nav_snapshot, acct["id"],
+            )
+            self._last_nav_date = today
+            logger.info("Daily NAV snapshot stored: %s total=%s", today, snap["total_value"])
+        except Exception:
+            logger.exception("Daily NAV snapshot failed")
+
     async def _fire_scheduled(self, schedule: dict):
         """Fire a schedule and advance its state (next_run_at, fail_count)."""
         sid = schedule["id"]
@@ -254,10 +284,32 @@ class SchedulerService:
             queue: asyncio.Queue = asyncio.Queue()  # nobody listens for scheduled runs
             runner = GraphRunner(analysis_id, config, analysts, queue)
             result = await runner.run()
-            return result is not None
+            ok = result is not None
+            # Auto-trade hook: if this schedule has auto_trade enabled and the
+            # analysis completed, turn its decision into a paper order. Failures
+            # here are logged but never fail the schedule fire.
+            if ok and schedule.get("auto_trade"):
+                await self._auto_trade(schedule, analysis_id)
+            return ok
         except Exception:
             logger.exception("Schedule %s analysis %s failed", schedule["id"], analysis_id)
             return False
+
+    async def _auto_trade(self, schedule: dict, analysis_id: str):
+        loop = asyncio.get_running_loop()
+        try:
+            from .routers.paper import execute_auto_trade
+            frac = schedule.get("auto_trade_cash_fraction") or 0.1
+            order, reason = await loop.run_in_executor(
+                None,
+                lambda: execute_auto_trade(analysis_id, cash_fraction=float(frac)),
+            )
+            logger.info(
+                "Schedule %s auto-trade (%s): %s",
+                schedule["id"], "filled" if order else "skipped", reason,
+            )
+        except Exception:
+            logger.exception("Schedule %s auto-trade crashed", schedule["id"])
 
 
 # Module-level singleton — main.lifespan starts/stops this.

@@ -428,12 +428,14 @@ const orderColumns = computed(() => [
     key: 'source',
     width: 130,
     render(r: PaperOrder) {
-      if (r.source === 'decision' && r.source_analysis_id) {
+      if ((r.source === 'decision' || r.source === 'auto') && r.source_analysis_id) {
+        const label = r.source === 'auto' ? t('paper.source.auto') : t('paper.source.decision')
         return h('a', {
-          style: { color: '#3060d0', cursor: 'pointer' },
+          style: { color: r.source === 'auto' ? '#d09030' : '#3060d0', cursor: 'pointer' },
           onClick: () => router.push(`/report/${r.source_analysis_id}`),
-        }, t('paper.source.decision'))
+        }, label)
       }
+      if (r.source === 'screen') return t('paper.source.screen')
       return r.source === 'manual' ? t('paper.source.manual') : r.source
     },
   },
