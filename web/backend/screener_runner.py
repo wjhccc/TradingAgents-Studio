@@ -50,9 +50,13 @@ class ScreenerRunner:
         await self.queue.put(event)
 
     async def run(self):
+        # The snapshot fetch retries over a flaky network for up to ~30s; run
+        # it on the dedicated heavy pool, not the default executor that serves
+        # request-path DB calls, so a slow screen never stalls other endpoints.
+        from .executors import heavy_executor
         try:
             await self._emit("screen_start", f"开始选股: {self.text or '(默认因子)'}")
-            result = await self._loop.run_in_executor(None, self._run_sync_with_events)
+            result = await self._loop.run_in_executor(heavy_executor, self._run_sync_with_events)
             await self._emit(
                 "screen_complete",
                 f"完成，命中 {result['matched']} 只，返回 Top {len(result['candidates'])}",
@@ -121,6 +125,11 @@ class ScreenerRunner:
                           f"本次按动量/资金流选股（估值类条件已忽略）")
         filtered = factors.apply_filters(snapshot, spec)
         matched = len(filtered)
+        if getattr(spec, "buyable_only", False) and matched == 0:
+            self._enqueue("warning",
+                          "已开启『只看可买入』，但当前市场强势股多已涨停/高位，"
+                          "暂无可低吸的标的；可改用『近一周/近一月』周期找尚未启动的票，"
+                          "或取消该选项查看全部。")
         cap_flow = None
         # Only fetch capital flow if it actually influences the ranking.
         if spec.weights.get("capital_flow", 0):
@@ -129,11 +138,14 @@ class ScreenerRunner:
         # Resolve which column feeds the momentum factor for the chosen period.
         momentum_col = self._resolve_momentum_column(spec, filtered, universe, meta)
 
+        # No ranking-level buyability penalty: '强势追涨' must show the raw 涨幅榜
+        # (limit-ups at the top), and '只看可买入' already *filters* un-enterable
+        # names out upstream, so demoting them in the sort would be redundant.
         scored = factors.score_and_rank(
             filtered, spec.weights, capital_flow=cap_flow, top_n=self.top_n,
             momentum_col=momentum_col, momentum_direction=spec.momentum_direction,
         )
-        candidates = factors.to_candidates(scored)
+        candidates = factors.to_candidates(scored, momentum_direction=spec.momentum_direction)
         self._enqueue("screened",
                       f"粗筛命中 {matched} 只（数据源：{meta.get('source')}），取 Top {len(candidates)}",
                       extra={"matched": matched, "data_source": meta.get("source"),
@@ -206,7 +218,8 @@ class ScreenerRunner:
             "pe_min", "pe_max", "pb_min", "pb_max", "market_cap_min",
             "market_cap_max", "change_pct_min", "change_pct_max",
             "turnover_min", "turnover_max", "sector_query", "exclude_st",
-            "momentum_period", "momentum_direction",
+            "momentum_period", "momentum_direction", "main_board_only",
+            "buyable_only",
         }
         for k, v in self.filters.items():
             if k in allowed and v is not None:

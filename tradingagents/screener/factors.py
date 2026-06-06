@@ -62,6 +62,14 @@ class StrategySpec:
     # delisting stocks (退市华嵘 -90% etc.) which are near-zero, not rebound
     # candidates. Also drops 新股/N (first-day) which have no real history.
     exclude_st: bool = True
+    # Keep only barrier-free names — 沪深主板 (无门槛). Drops 创业板/科创板/北交所
+    # and ST, which an ordinary new account can't trade without a 资金/经验门槛
+    # or extra permission. See ``signals.requires_permission``.
+    main_board_only: bool = False
+    # Keep only names you can realistically still enter — excludes limit-up /
+    # over-extended (can't get filled next day) and hard sell-offs. The
+    # decisive "只看可买入" filter; see ``signals.in_enterable_band``.
+    buyable_only: bool = False
     # Ranking weights per factor.
     weights: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     # Free-text labels for provenance / UI ("低估值", "白酒概念", ...).
@@ -105,6 +113,30 @@ def apply_filters(df: pd.DataFrame, spec: StrategySpec) -> pd.DataFrame:
         bad |= nm.str.match(r"^[NC][一-鿿]", na=False)
         out = out[~bad]
 
+    if spec.main_board_only and "code" in out.columns:
+        # Keep only barrier-free 沪深主板 names (无门槛). ST already dropped above
+        # when exclude_st; this additionally removes 创业板/科创板/北交所.
+        from .signals import requires_permission
+        names = out["name"] if "name" in out.columns else [None] * len(out)
+        keep = [not requires_permission(c, n) for c, n in zip(out["code"], names)]
+        out = out[pd.Series(keep, index=out.index)]
+
+    if spec.buyable_only and {"code", "change_pct"} <= set(out.columns):
+        # Keep only names whose deterministic verdict is actually enterable, so
+        # the ranking sees exactly the set we'll label buyable — no limit-up,
+        # over-extended, crashing, or "观望" names slip through. This is the
+        # heart of "找出能买的股票"; uses the same signal shown per candidate.
+        from .signals import action_signal
+        names = out["name"] if "name" in out.columns else [None] * len(out)
+        turn = out["turnover"] if "turnover" in out.columns else [None] * len(out)
+        flow = out["main_net_inflow"] if "main_net_inflow" in out.columns else [None] * len(out)
+        keep = [
+            action_signal(code=str(c), name=n, change_pct=chg, turnover=tv,
+                          main_net_inflow=fv, direction=spec.momentum_direction).get("buyable", False)
+            for c, n, chg, tv, fv in zip(out["code"], names, out["change_pct"], turn, flow)
+        ]
+        out = out[pd.Series(keep, index=out.index)]
+
     if spec.universe_codes is not None:
         codes = {str(c).zfill(6) for c in spec.universe_codes}
         out = out[out["code"].isin(codes)]
@@ -146,6 +178,7 @@ def score_and_rank(
     top_n: Optional[int] = None,
     momentum_col: str = "change_pct",
     momentum_direction: str = "up",
+    buyability_penalty: float = 0.0,
 ) -> pd.DataFrame:
     """Attach per-factor sub-scores + a weighted composite, sorted desc.
 
@@ -159,6 +192,14 @@ def score_and_rank(
     flips the sign so the *worst* performers rank highest — oversold-rebound
     screening. The scored momentum value is also copied to ``momentum_value``
     so ``to_candidates`` can surface the exact return used.
+
+    ``buyability_penalty`` (>0, only meaningful for a momentum-*up* screen on
+    *today*'s return) docks names that are already pinned near their daily
+    up-limit — you can't realistically buy those at the next open, so demoting
+    them keeps the surfaced Top-N actionable instead of a limit-up board. The
+    penalty (0..1 per ``signals.extension_penalty``) is scaled by this factor
+    and subtracted from the composite. ``score_raw`` preserves the pre-penalty
+    value so the factor breakdown stays interpretable.
     """
     if df.empty:
         return df.assign(score=[], rank=[])
@@ -193,7 +234,25 @@ def score_and_rank(
         + weights.get("momentum", 0) * out["score_momentum"]
         + weights.get("capital_flow", 0) * out["score_capital_flow"]
     ) / wsum
-    out["score"] = out["score"].round(4)
+    out["score_raw"] = out["score"].round(4)
+
+    # Buyability demerit: sink names already near their up-limit (un-enterable
+    # next day) so the Top-N is something you can actually act on. Only for an
+    # up-trend screen; mean-reversion ('down') wants the opposite extreme.
+    if buyability_penalty and momentum_direction != "down":
+        from .signals import board_limit_pct, extension_penalty
+        pen = out.apply(
+            lambda r: extension_penalty(
+                _f(r.get("change_pct")),
+                board_limit_pct(str(r.get("code")), r.get("name")),
+            ),
+            axis=1,
+        )
+        out["buyability_penalty"] = (pen * float(buyability_penalty)).round(4)
+        out["score"] = (out["score"] - out["buyability_penalty"]).round(4)
+    else:
+        out["buyability_penalty"] = 0.0
+        out["score"] = out["score_raw"]
 
     out = out.sort_values("score", ascending=False).reset_index(drop=True)
     out["rank"] = out.index + 1
@@ -202,36 +261,57 @@ def score_and_rank(
     return out
 
 
-def to_candidates(df: pd.DataFrame) -> list[dict]:
+def to_candidates(df: pd.DataFrame, momentum_direction: str = "up") -> list[dict]:
     """Serialize a scored frame into JSON-able candidate dicts.
 
     Splits objective ``metrics`` (sourced from data tools) from
     ``factor_breakdown`` (computed sub-scores) so the frontend can label
     provenance clearly — the LLM's rationale is added later, separately.
+
+    Each candidate also carries a ``signal`` dict (from ``signals.action_signal``)
+    — a deterministic, board-aware "can I buy this / when" verdict derived from
+    the same objective metrics. ``momentum_direction`` switches it between
+    trend-following and oversold-rebound semantics.
     """
+    from .signals import action_signal, trade_plan
+
     candidates = []
     for _, r in df.iterrows():
+        metrics = {
+            "price": _f(r.get("price")),
+            "change_pct": _f(r.get("change_pct")),
+            "momentum_value": _f(r.get("momentum_value")),
+            "pe": _f(r.get("pe")),
+            "pb": _f(r.get("pb")),
+            "market_cap": _f(r.get("market_cap")),
+            "turnover": _f(r.get("turnover")),
+            "main_net_inflow": _f(r.get("main_net_inflow")),
+        }
+        signal = action_signal(
+            code=str(r["code"]), name=r.get("name"),
+            change_pct=metrics["change_pct"], turnover=metrics["turnover"],
+            main_net_inflow=metrics["main_net_inflow"],
+            direction=momentum_direction,
+        )
+        # Concrete buy/sell plan for names actually worth entering.
+        if signal.get("buyable") and metrics["price"]:
+            plan = trade_plan(metrics["price"], signal.get("timing", "wait"),
+                              momentum_direction)
+            if plan:
+                signal["plan"] = plan
         candidates.append({
             "code": r["code"],
             "ticker": r["code"],
             "name": r.get("name"),
             "rank": int(r["rank"]) if "rank" in r and pd.notna(r["rank"]) else None,
             "score": float(r["score"]) if pd.notna(r.get("score")) else None,
-            "metrics": {
-                "price": _f(r.get("price")),
-                "change_pct": _f(r.get("change_pct")),
-                "momentum_value": _f(r.get("momentum_value")),
-                "pe": _f(r.get("pe")),
-                "pb": _f(r.get("pb")),
-                "market_cap": _f(r.get("market_cap")),
-                "turnover": _f(r.get("turnover")),
-                "main_net_inflow": _f(r.get("main_net_inflow")),
-            },
+            "metrics": metrics,
             "factor_breakdown": {
                 "value": _f(r.get("score_value")),
                 "momentum": _f(r.get("score_momentum")),
                 "capital_flow": _f(r.get("score_capital_flow")),
             },
+            "signal": signal,
             "source": "akshare/eastmoney",
         })
     return candidates

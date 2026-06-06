@@ -54,10 +54,18 @@ async def parse_nl_query(req: NLQueryRequest):
 
 @router.post("/analyze")
 async def start_analysis(req: AnalyzeRequest):
+    loop = asyncio.get_running_loop()
+
+    # Analysis needs an LLM with no fallback — fail fast with a clear message
+    # instead of creating a row that dies deep in the graph on a missing key.
+    from ..llm_health import check_llm_ready
+    err = await loop.run_in_executor(None, check_llm_ready)
+    if err:
+        raise HTTPException(status_code=400, detail=f"LLM 未就绪，无法启动分析：{err}")
+
     analysis_id = str(uuid.uuid4())
     config = build_config(req)
 
-    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: db.create_analysis(
         id=analysis_id,
         ticker=req.ticker,

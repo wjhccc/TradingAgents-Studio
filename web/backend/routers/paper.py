@@ -20,6 +20,7 @@ import logging
 import re
 import threading
 import time
+import urllib.request
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
@@ -38,11 +39,22 @@ router = APIRouter(prefix="/api/paper", tags=["paper"])
 # Paper / Holdings pages load they fetch quotes for every position, and
 # the same ticker can be hit twice within a few seconds (once for
 # positions, once for holdings, once for orders). Eastmoney drops the
-# 2nd request with RemoteDisconnected. A 15-second TTL is enough to
-# collapse the storm without making the displayed price feel stale.
+# 2nd request with RemoteDisconnected. A 20-second TTL keeps intraday prices
+# fresh enough that the Paper page's auto-refresh visibly moves P&L, while
+# still collapsing the burst of per-row quote requests one page render fires.
+# (The live single-quote endpoints we hit aren't rate-limited, so a short TTL
+# is safe — see _fetch_spot_price.)
 _PRICE_CACHE: dict[str, tuple[float, Optional[float]]] = {}
-_PRICE_CACHE_TTL_SEC = 15.0
+_PRICE_CACHE_TTL_SEC = 20.0
 _PRICE_CACHE_LOCK = threading.Lock()
+
+# Hard ceiling on the priced /positions path. When every upstream A-share feed
+# is down (eastmoney RST → sina → tencent → yahoo all fail+retry per ticker),
+# decorating N positions can take tens of seconds. We'd rather return whatever
+# quotes came back within the budget and leave the rest null (frontend shows
+# "—") than make the price-refresh spinner hang. The table is already painted
+# by the with_prices=false call, so this only bounds the enrichment step.
+_PRICE_PATH_BUDGET_SEC = 8.0
 
 
 def _price_cache_get(ticker: str) -> tuple[bool, Optional[float]]:
@@ -61,6 +73,63 @@ def _price_cache_get(ticker: str) -> tuple[bool, Optional[float]]:
 def _price_cache_put(ticker: str, price: Optional[float]) -> None:
     with _PRICE_CACHE_LOCK:
         _PRICE_CACHE[ticker.upper()] = (time.monotonic() + _PRICE_CACHE_TTL_SEC, price)
+
+
+# --- A-share code → name map -------------------------------------------------
+# The whole A-share name list comes from one lightweight AKShare call
+# (``stock_info_a_code_name``: ~5500 rows of code+name, no quotes), cached for
+# hours since listings rename rarely. Positions/orders only ever need a dict
+# lookup off this map, so we never fan out per-ticker name fetches.
+_NAME_MAP: dict[str, str] = {}
+_NAME_MAP_EXPIRES = 0.0
+_NAME_MAP_LOCK = threading.Lock()
+_NAME_MAP_TTL_SEC = 6 * 3600.0
+
+
+def _name_map() -> dict[str, str]:
+    """Cached ``{6-digit code: name}`` for the whole A-share market.
+
+    Best-effort: on fetch failure returns whatever is cached (possibly empty)
+    so the name column just degrades to blank rather than failing the page.
+    """
+    global _NAME_MAP_EXPIRES
+    now = time.monotonic()
+    with _NAME_MAP_LOCK:
+        if _NAME_MAP and now < _NAME_MAP_EXPIRES:
+            return _NAME_MAP
+    try:
+        import tradingagents.dataflows  # noqa: F401 — NO_PROXY bootstrap
+        import akshare as ak
+        df = ak.stock_info_a_code_name()
+        fresh = {str(c).zfill(6): str(n) for c, n in zip(df["code"], df["name"])}
+    except Exception as e:  # noqa: BLE001 — name lookup is non-essential
+        logger.warning("stock name map fetch failed (names degrade to blank): %s", e)
+        fresh = {}
+    with _NAME_MAP_LOCK:
+        if fresh:
+            _NAME_MAP.clear()
+            _NAME_MAP.update(fresh)
+            _NAME_MAP_EXPIRES = now + _NAME_MAP_TTL_SEC
+        return _NAME_MAP
+
+
+def _name_map_cached_only() -> dict[str, str]:
+    """Return the name map ONLY if already cached — never fetches.
+
+    Used by the instant (``with_prices=false``) path so a cold name-map cache
+    can't block the fast first paint on a slow upstream. Names then fill in on
+    the subsequent priced fetch, which does warm the map.
+    """
+    with _NAME_MAP_LOCK:
+        return dict(_NAME_MAP) if _NAME_MAP else {}
+
+
+def _resolve_name(ticker: str) -> Optional[str]:
+    """Best-effort display name for a ticker; None for non-A-share / unknown."""
+    digits = re.sub(r"\D", "", ticker or "")
+    if len(digits) >= 6:
+        return _name_map().get(digits[-6:])
+    return None
 
 
 # --- helpers ---
@@ -144,13 +213,13 @@ def _parse_decision_card(reports: list, final_decision: str) -> dict[str, Any]:
 
 
 def _fetch_last_price_sync(ticker: str) -> Optional[float]:
-    """Latest close via the same vendor router holdings.quote uses.
+    """Latest price for a ticker (live intraday quote, kline close as fallback).
 
-    Wrapped with a 15-second in-process cache so rapid repeat hits (the
-    Paper / Holdings pages tend to fan out per-row quote requests, and
-    refresh on focus) don't trigger eastmoney's per-IP RST throttling.
-    A None result is also cached for the TTL — saves us from retrying a
-    delisted / suspended ticker every render.
+    Wrapped with the in-process price cache (see ``_PRICE_CACHE_TTL_SEC``) so
+    rapid repeat hits — the Paper / Holdings pages fan out per-row quote
+    requests, plus refresh-on-focus — collapse onto one upstream call. A None
+    result is cached too, so a delisted / suspended ticker isn't retried every
+    render.
     """
     hit, cached = _price_cache_get(ticker)
     if hit:
@@ -160,7 +229,91 @@ def _fetch_last_price_sync(ticker: str) -> Optional[float]:
     return price
 
 
+def _spot_secid(ticker: str) -> Optional[tuple[str, str, str]]:
+    """Map a 6-digit A-share code to (sina_sym, tencent_sym, em_secid).
+
+    Prefix → exchange: 6/9 → 沪 (sh / em market 1); else → 深 (sz / em market 0).
+    Returns None for non-6-digit (e.g. US) tickers, which fall back to klines.
+    """
+    digits = re.sub(r"\D", "", ticker or "")
+    if len(digits) < 6:
+        return None
+    code = digits[-6:]
+    if code[0] in ("6", "9"):
+        return f"sh{code}", f"sh{code}", f"1.{code}"
+    return f"sz{code}", f"sz{code}", f"0.{code}"
+
+
+def _fetch_spot_price(ticker: str) -> Optional[float]:
+    """Live intraday last price via the lightweight single-quote endpoints.
+
+    These vendor quote endpoints (tencent qt.gtimg.cn, sina hq.sinajs.cn,
+    eastmoney push2) return one ticker in a few KB and — unlike the bulk
+    spot/kline endpoints AKShare scrapes — are NOT aggressively rate-limited,
+    so they stay fast and reliable when ``stock_zh_a_spot_em`` gets RST-throttled.
+    Using a live quote (not yesterday's / today's kline close) also means
+    intraday P&L reflects the current price instead of sticking near cost.
+    Tries tencent → sina → eastmoney; returns None if all fail (caller then
+    falls back to the kline path).
+    """
+    syms = _spot_secid(ticker)
+    if not syms:
+        return None
+    sina_sym, tx_sym, em_secid = syms
+
+    def _get(url: str, referer: str) -> Optional[str]:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
+            return urllib.request.urlopen(req, timeout=4).read().decode("gbk", "ignore")
+        except Exception:  # noqa: BLE001 — try the next vendor
+            return None
+
+    # 1) Tencent: v_sz300686="51~名称~code~<last>~<prev_close>~..."
+    body = _get(f"https://qt.gtimg.cn/q={tx_sym}", "https://gu.qq.com/")
+    if body and "~" in body:
+        try:
+            parts = body.split('"')[1].split("~")
+            price = float(parts[3])
+            if price > 0:
+                return round(price, 3)
+        except (IndexError, ValueError):
+            pass
+
+    # 2) Sina: var hq_str_sz300686="名称,open,prev_close,<last>,high,low,..."
+    body = _get(f"https://hq.sinajs.cn/list={sina_sym}", "https://finance.sina.com.cn/")
+    if body and '"' in body:
+        try:
+            parts = body.split('"')[1].split(",")
+            price = float(parts[3])
+            if price > 0:
+                return round(price, 3)
+        except (IndexError, ValueError):
+            pass
+
+    # 3) Eastmoney: {"data":{"f43":<last*100>,...}} — f43 is price in 分.
+    body = _get(
+        f"https://push2.eastmoney.com/api/qt/stock/get?secid={em_secid}&fields=f43",
+        "https://quote.eastmoney.com/")
+    if body and '"f43"' in body:
+        try:
+            import json
+            f43 = json.loads(body).get("data", {}).get("f43")
+            if f43 and f43 > 0:
+                return round(f43 / 100.0, 3)
+        except (ValueError, TypeError, KeyError):
+            pass
+
+    return None
+
+
 def _fetch_last_price_uncached(ticker: str) -> Optional[float]:
+    # Prefer the fast, un-throttled live quote; only fall back to the heavier
+    # kline path (route_to_vendor) when all spot endpoints fail.
+    spot = _fetch_spot_price(ticker)
+    if spot is not None:
+        return spot
+
     from tradingagents.dataflows.interface import route_to_vendor
 
     end_dt = datetime.utcnow()
@@ -222,31 +375,76 @@ async def reset(req: PaperAccountReset):
         )
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
-    updated = await loop.run_in_executor(None, db.reset_paper_account, acct["id"])
+    updated = await loop.run_in_executor(
+        None, db.reset_paper_account, acct["id"], req.initial_cash)
     return updated
 
 
 @router.get("/positions")
-async def positions():
-    """Current open positions, decorated with live quote + P&L."""
+async def positions(with_prices: bool = True):
+    """Current open positions.
+
+    ``with_prices`` (default True) decorates each row with a live quote + P&L,
+    which means a (cache-cold) kline fetch per ticker — the slow part. The
+    Paper page calls it twice: first ``with_prices=false`` to paint the table
+    instantly, then ``with_prices=true`` to fill in quotes asynchronously. So a
+    page visit feels instant even when the upstream quote feed is degraded.
+    """
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
     positions = await loop.run_in_executor(None, db.list_paper_positions, acct["id"])
 
+    if not with_prices:
+        # Instant path: holdings only. Use names ONLY if already cached — don't
+        # warm the map here, since a cold fetch over a slow feed would defeat
+        # the whole point of the fast paint. Names + prices arrive on the
+        # subsequent with_prices=true fetch.
+        name_cache = _name_map_cached_only()
+        items = [{**p, "name": name_cache.get(re.sub(r"\D", "", p["ticker"])[-6:]),
+                  "last_price": None, "market_value": None,
+                  "pnl_amount": None, "pnl_pct": None}
+                 for p in positions]
+        return {"items": items, "total": len(items)}
+
+    # Warm the name map once off-loop; decorate() then does cheap dict lookups.
+    await loop.run_in_executor(None, _name_map)
+
     async def decorate(p):
+        name = _resolve_name(p["ticker"])
         last = await loop.run_in_executor(None, _fetch_last_price_sync, p["ticker"])
         if last is None:
-            return {**p, "last_price": None, "market_value": None,
+            return {**p, "name": name, "last_price": None, "market_value": None,
                     "pnl_amount": None, "pnl_pct": None}
         shares = float(p["shares"])
         cost = float(p["avg_cost"])
         mv = round(shares * last, 2)
         pnl = round(shares * (last - cost), 2)
         pct = round((last - cost) / cost * 100, 2) if cost else None
-        return {**p, "last_price": last, "market_value": mv,
+        return {**p, "name": name, "last_price": last, "market_value": mv,
                 "pnl_amount": pnl, "pnl_pct": pct}
 
-    decorated = await asyncio.gather(*(decorate(p) for p in positions))
+    # Decorate concurrently, but cap the whole batch at _PRICE_PATH_BUDGET_SEC.
+    # On timeout, return rows that finished (priced) and fall back to bare
+    # holdings for the rest, so a dead quote feed can't hang the request.
+    tasks = [asyncio.ensure_future(decorate(p)) for p in positions]
+    try:
+        decorated = await asyncio.wait_for(
+            asyncio.gather(*tasks), timeout=_PRICE_PATH_BUDGET_SEC
+        )
+    except asyncio.TimeoutError:
+        decorated = []
+        for p, task in zip(positions, tasks):
+            if task.done() and not task.cancelled() and not task.exception():
+                decorated.append(task.result())
+            else:
+                task.cancel()
+                decorated.append({**p, "name": _resolve_name(p["ticker"]),
+                                  "last_price": None, "market_value": None,
+                                  "pnl_amount": None, "pnl_pct": None})
+        logger.warning("positions price path timed out at %.0fs; %d/%d priced",
+                       _PRICE_PATH_BUDGET_SEC,
+                       sum(1 for d in decorated if d["last_price"] is not None),
+                       len(decorated))
     return {"items": decorated, "total": len(decorated)}
 
 
@@ -255,6 +453,8 @@ async def orders():
     loop = asyncio.get_running_loop()
     acct = await loop.run_in_executor(None, db.ensure_default_paper_account)
     items = await loop.run_in_executor(None, db.list_paper_orders, acct["id"], 200)
+    await loop.run_in_executor(None, _name_map)  # warm cache off-loop
+    items = [{**o, "name": _resolve_name(o["ticker"])} for o in items]
     return {"items": items, "total": len(items)}
 
 

@@ -19,6 +19,7 @@ the web backend has started already have it in effect.
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from typing import Callable, Optional
@@ -48,6 +49,9 @@ def _fetch_with_retry(fn: Callable[[], object], *, label: str,
     eastmoney's full-market ``clist`` endpoint RST-throttles bursty clients;
     a short backoff usually clears it. Raises ``MarketDataUnavailable`` with
     a friendly message once attempts are exhausted.
+
+    The backoff carries ±25% jitter so concurrent screen runs don't retry in
+    lock-step and re-trigger the same burst-throttle they're backing off from.
     """
     last: Optional[Exception] = None
     for i in range(attempts):
@@ -55,7 +59,7 @@ def _fetch_with_retry(fn: Callable[[], object], *, label: str,
             return fn()
         except _RETRYABLE as e:  # noqa: PERF203
             last = e
-            wait = base_sleep * (2 ** i)
+            wait = base_sleep * (2 ** i) * (0.75 + 0.5 * random.random())
             logger.warning("%s fetch attempt %d/%d failed (%s); retrying in %.1fs",
                            label, i + 1, attempts, type(e).__name__, wait)
             if i < attempts - 1:
@@ -163,8 +167,15 @@ def _normalize_em(raw: pd.DataFrame) -> pd.DataFrame:
 
 
 def _snap_em_full() -> pd.DataFrame:
-    """Primary: one shot for the whole market (richest, most RST-prone)."""
-    raw = _fetch_with_retry(lambda: _ak().stock_zh_a_spot_em(), label="全市场快照(东财)")
+    """Primary: one shot for the whole market (richest, most RST-prone).
+
+    Fails fast (2 attempts, short backoff): when the full ``clist`` is being
+    RST-throttled it rarely recovers within a couple of seconds, so we'd
+    rather fall through to the per-exchange / 新浪 sources than keep the user
+    waiting on a source that's already rate-limiting us.
+    """
+    raw = _fetch_with_retry(lambda: _ak().stock_zh_a_spot_em(),
+                            label="全市场快照(东财)", attempts=2, base_sleep=0.5)
     return _normalize_em(raw)
 
 
@@ -182,7 +193,7 @@ def _snap_em_by_exchange() -> pd.DataFrame:
         fn = getattr(ak, fn_name, None)
         if fn is None:
             continue
-        parts.append(_normalize_em(_fetch_with_retry(fn, label=f"快照{label}", attempts=2)))
+        parts.append(_normalize_em(_fetch_with_retry(fn, label=f"快照{label}", attempts=2, base_sleep=0.5)))
     if not parts:
         raise MarketDataUnavailable("分交易所快照接口均不可用")
     return pd.concat(parts, ignore_index=True).drop_duplicates(subset="code")
@@ -194,7 +205,7 @@ def _snap_sina() -> pd.DataFrame:
     Only price/change/amount are available, so value/size filters can't run.
     Marked ``coverage='partial'`` so the runner warns the user.
     """
-    raw = _fetch_with_retry(lambda: _ak().stock_zh_a_spot(), label="全市场快照(新浪)", attempts=2)
+    raw = _fetch_with_retry(lambda: _ak().stock_zh_a_spot(), label="全市场快照(新浪)", attempts=2, base_sleep=0.5)
     out = pd.DataFrame()
     out["code"] = raw[_pick(raw, "代码", "symbol")].astype(str).str.replace(r"\D", "", regex=True).str.zfill(6)
     out["name"] = raw[_pick(raw, "名称", "name")].astype(str)
@@ -332,10 +343,14 @@ def rank_capital_flow(ttl: float = _DEFAULT_TTL) -> pd.DataFrame:
         try:
             raw = _fetch_with_retry(
                 lambda: _ak().stock_individual_fund_flow_rank(indicator="今日"),
-                label="个股资金流", attempts=2,
+                label="个股资金流", attempts=2, base_sleep=0.5,
             )
         except Exception as e:  # noqa: BLE001
-            logger.warning("capital flow rank fetch failed: %s", e)
+            # eastmoney is the only free per-stock capital-flow source, so on
+            # failure we degrade to an empty frame (callers left-join, so the
+            # capital_flow factor just goes neutral) rather than blocking the
+            # whole screen on a dimension that has no fallback vendor.
+            logger.warning("capital flow rank fetch failed (factor degrades to neutral): %s", e)
             return pd.DataFrame(columns=["code", "main_net_inflow", "main_net_pct"])
         out = pd.DataFrame()
         out["code"] = raw[_pick(raw, "代码")].astype(str).str.zfill(6)

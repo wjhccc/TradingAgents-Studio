@@ -111,6 +111,7 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog, NButton, NSpace, NTag, NText } from 'naive-ui'
 import api from '../api'
+import { formatDateTime } from '../utils/datetime'
 
 interface Schedule {
   id: number
@@ -183,8 +184,10 @@ function describePattern(s: Schedule): string {
 }
 
 function formatDate(s: string | null): string {
+  // Was a raw ISO slice (UTC, off by the local offset). Use the shared
+  // local-time formatter and trim the seconds for a compact schedule cell.
   if (!s) return '—'
-  return s.replace('T', ' ').slice(0, 16)
+  return formatDateTime(s).slice(0, 16)
 }
 
 const columns = computed(() => [
