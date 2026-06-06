@@ -356,6 +356,142 @@ def _fetch_last_price_uncached(ticker: str) -> Optional[float]:
     return float(closes[-1])
 
 
+# ---------------------------------------------------------------------------
+# Market-state snapshot (for auto-trade suspension / limit-up-down checks)
+# ---------------------------------------------------------------------------
+# Unlike ``_fetch_last_price_*`` (which only needs the latest price for P&L
+# display), the auto-trade hook needs more context: the previous close (to
+# compute the day's % move for a limit check) and the most recent bar date
+# (to detect a suspended / stale ticker). This is a separate, heavier path
+# called at most once per auto-trade decision, so it doesn't share the hot
+# UI quote cache.
+
+
+def _spot_snapshot(ticker: str) -> Optional[dict]:
+    """Live snapshot via tencent/sina single-quote endpoints.
+
+    Returns ``{last, prev_close, high, low}`` (any field may be None) or None
+    if the ticker isn't an A-share code or all vendors fail. Reuses the same
+    endpoints + parsing shape as ``_fetch_spot_price``; tencent and sina both
+    carry prev_close, sina additionally carries today's high/low.
+    """
+    syms = _spot_secid(ticker)
+    if not syms:
+        return None
+    sina_sym, tx_sym, _ = syms
+
+    def _get(url: str, referer: str) -> Optional[str]:
+        try:
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "Mozilla/5.0", "Referer": referer})
+            return urllib.request.urlopen(req, timeout=4).read().decode("gbk", "ignore")
+        except Exception:  # noqa: BLE001
+            return None
+
+    # Sina is richest: "名称,open,prev_close,last,high,low,..." — try it first.
+    body = _get(f"https://hq.sinajs.cn/list={sina_sym}", "https://finance.sina.com.cn/")
+    if body and '"' in body:
+        try:
+            parts = body.split('"')[1].split(",")
+            last = float(parts[3])
+            prev = float(parts[2])
+            high = float(parts[4])
+            low = float(parts[5])
+            if last > 0 and prev > 0:
+                return {"last": round(last, 3), "prev_close": round(prev, 3),
+                        "high": round(high, 3) if high > 0 else None,
+                        "low": round(low, 3) if low > 0 else None}
+        except (IndexError, ValueError):
+            pass
+
+    # Tencent fallback: "51~名称~code~last~prev_close~..." (no clean high/low here).
+    body = _get(f"https://qt.gtimg.cn/q={tx_sym}", "https://gu.qq.com/")
+    if body and "~" in body:
+        try:
+            parts = body.split('"')[1].split("~")
+            last = float(parts[3])
+            prev = float(parts[4])
+            if last > 0 and prev > 0:
+                return {"last": round(last, 3), "prev_close": round(prev, 3),
+                        "high": None, "low": None}
+        except (IndexError, ValueError):
+            pass
+    return None
+
+
+def _kline_snapshot(ticker: str) -> Optional[dict]:
+    """Kline-based snapshot: last two closes + the most recent bar date.
+
+    The bar date is what staleness/suspension detection keys off — a non-
+    today last bar (allowing for weekends) means the ticker likely isn't
+    trading. Returns ``{last, prev_close, high, low, bar_date}`` or None.
+    """
+    from tradingagents.dataflows.interface import route_to_vendor
+
+    end_dt = datetime.utcnow()
+    start_dt = end_dt - timedelta(days=15)
+    try:
+        csv_str = route_to_vendor(
+            "get_stock_data", ticker,
+            start_dt.strftime("%Y-%m-%d"), end_dt.strftime("%Y-%m-%d"),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("snapshot kline fetch failed for %s: %s", ticker, e)
+        return None
+    if not isinstance(csv_str, str):
+        return None
+    header_end = csv_str.find("\n\n")
+    data_section = csv_str[header_end + 2:] if header_end != -1 else csv_str
+    if "No " in csv_str[:200] and "data" in csv_str[:200]:
+        return None
+    try:
+        df = pd.read_csv(io.StringIO(data_section))
+    except Exception:  # noqa: BLE001
+        return None
+    if df.empty or "Close" not in df.columns:
+        return None
+    # Resolve the date column (Date / date / first unnamed col / index).
+    date_col = next((c for c in ("Date", "date", "Unnamed: 0") if c in df.columns), None)
+    bar_date = None
+    if date_col is not None:
+        try:
+            bar_date = pd.to_datetime(df[date_col]).dt.date.iloc[-1]
+        except Exception:  # noqa: BLE001
+            bar_date = None
+    closes = df["Close"].dropna().tolist()
+    if not closes:
+        return None
+    last_row = df.iloc[-1]
+    return {
+        "last": float(closes[-1]),
+        "prev_close": float(closes[-2]) if len(closes) >= 2 else None,
+        "high": float(last_row["High"]) if "High" in df.columns and pd.notna(last_row.get("High")) else None,
+        "low": float(last_row["Low"]) if "Low" in df.columns and pd.notna(last_row.get("Low")) else None,
+        "bar_date": bar_date,
+    }
+
+
+def _fetch_quote_snapshot(ticker: str) -> Optional[dict]:
+    """Best-effort market snapshot for auto-trade gating.
+
+    Merges the live spot quote (fresh last/prev/high/low, but no bar date)
+    with the kline snapshot (carries bar_date for staleness). Prefers live
+    values where present. Returns a dict with keys
+    ``last, prev_close, high, low, bar_date`` (any may be None) or None.
+    """
+    spot = _spot_snapshot(ticker)
+    kline = _kline_snapshot(ticker)
+    if spot is None and kline is None:
+        return None
+    snap = dict(kline or {})
+    if spot:
+        for k in ("last", "prev_close", "high", "low"):
+            if spot.get(k) is not None:
+                snap[k] = spot[k]
+    snap.setdefault("bar_date", None)
+    return snap
+
+
 # --- endpoints ---
 
 @router.get("/account")
@@ -626,6 +762,62 @@ def compute_and_store_nav_snapshot(account_id: int) -> dict:
     }
 
 
+def _limit_pct_for(ticker: str, name: Optional[str]) -> Optional[float]:
+    """Daily price-limit magnitude for an A-share, as a fraction (0.10 = ±10%).
+
+    Rules (Shanghai/Shenzhen): ST / *ST → ±5%; 创业板 (300xxx) / 科创板
+    (688xxx) → ±20%; 北交所 (8xx/4xx) → ±30%; everything else → ±10%.
+    Returns None for non-A-share tickers (no limit modelled — US etc.).
+    """
+    if not db._is_a_share_ticker(ticker):
+        return None
+    if name and ("ST" in name.upper() or "退" in name):
+        return 0.05
+    digits = re.sub(r"\D", "", ticker or "")
+    code = digits[-6:] if len(digits) >= 6 else digits
+    if code.startswith(("300", "301", "688")):
+        return 0.20
+    if code.startswith(("8", "4")):
+        return 0.30  # 北交所
+    return 0.10
+
+
+def _check_market_state(ticker: str, action: str) -> Optional[str]:
+    """Gate an auto-trade against suspension + price-limit conditions.
+
+    Returns a human-readable skip reason if the order should NOT go through,
+    or None if it's clear to trade. Best-effort: a missing snapshot or
+    non-A-share ticker returns None (trade allowed) rather than blocking.
+    """
+    snap = _fetch_quote_snapshot(ticker)
+    if not snap:
+        return None  # no data → don't block; downstream price fetch handles it
+
+    # --- suspension / stale-data: last kline bar isn't recent enough ---
+    bar_date = snap.get("bar_date")
+    if bar_date is not None:
+        gap_days = (datetime.now().date() - bar_date).days
+        # >4 calendar days covers a normal Fri→next-week gap; beyond that the
+        # ticker is almost certainly suspended or delisted.
+        if gap_days > 4:
+            return f"{ticker} 最新行情停留在 {bar_date}（疑似停牌/退市），跳过"
+
+    # --- limit up / down: compute today's % move vs prev close ---
+    last = snap.get("last")
+    prev = snap.get("prev_close")
+    limit = _limit_pct_for(ticker, _resolve_name(ticker))
+    if last and prev and prev > 0 and limit is not None:
+        move = (last - prev) / prev
+        # Use a small tolerance so a price a hair below the cap still counts
+        # as limit (boards round to a tick; we don't have the exact cap price).
+        near = limit - 0.003
+        if action == "buy" and move >= near:
+            return f"{ticker} 涨幅 {move*100:.1f}% 触及涨停（限制 ±{limit*100:.0f}%），买不进，跳过"
+        if action == "sell" and move <= -near:
+            return f"{ticker} 跌幅 {move*100:.1f}% 触及跌停（限制 ±{limit*100:.0f}%），卖不出，跳过"
+    return None
+
+
 def execute_auto_trade(
     analysis_id: str,
     *,
@@ -666,6 +858,12 @@ def execute_auto_trade(
         acct = db.ensure_default_paper_account()
         positions = db.list_paper_positions(acct["id"])
         pos = next((p for p in positions if p["ticker"] == ticker.upper()), None)
+
+        # Suspension / limit-up-down gate: skip orders that couldn't fill in
+        # a real market (suspended ticker, or a board locked at its daily cap).
+        blocked = _check_market_state(ticker, action)
+        if blocked:
+            return None, blocked
 
         price = parsed.get("entry_price")
         if price is None or price <= 0:

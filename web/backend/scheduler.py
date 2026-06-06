@@ -44,6 +44,17 @@ _MAX_CATCH_UP_SECONDS = 24 * 3600
 # without anyone clicking the manual button. 15:05 ≈ just after A-share close.
 _NAV_SNAPSHOT_AFTER_HHMM = (15, 5)
 
+# Max number of scheduled analyses allowed to run concurrently. When more
+# schedules come due at once (e.g. a screened portfolio all set to 09:30),
+# the excess queue and start as slots free up. Keeps us from fanning out N
+# parallel LLM + market-data calls and tripping provider rate limits / RSTs.
+_MAX_CONCURRENT_RUNS = 3
+
+# A single scheduled run shouldn't take longer than this. If one hangs past
+# the timeout it's cancelled and recorded as a failure, so the watchdog frees
+# its in-flight slot rather than letting it block that schedule forever.
+_RUN_TIMEOUT_SEC = 20 * 60
+
 
 def _now_iso() -> str:
     """Server-local ISO timestamp (no timezone marker)."""
@@ -121,9 +132,13 @@ class SchedulerService:
     def __init__(self):
         self._task: Optional[asyncio.Task] = None
         self._stop_event: Optional[asyncio.Event] = None
-        # Schedule IDs currently being processed, so we don't double-fire if
-        # a run lasts longer than the next tick.
-        self._in_flight: set[int] = set()
+        # Schedule IDs currently being processed → wall-clock start time, so we
+        # don't double-fire if a run outlasts the next tick, and so the
+        # watchdog can reclaim a slot whose run hung past _RUN_TIMEOUT_SEC.
+        self._in_flight: dict[int, datetime] = {}
+        # Caps how many runs execute at once; excess queue. Created in start()
+        # because a Semaphore must bind to the running loop.
+        self._run_sem: Optional[asyncio.Semaphore] = None
         # Last date (YYYY-MM-DD, server-local) we stored a NAV snapshot, so the
         # daily auto-snapshot fires at most once per calendar day.
         self._last_nav_date: Optional[str] = None
@@ -132,8 +147,12 @@ class SchedulerService:
         if self._task and not self._task.done():
             return
         self._stop_event = asyncio.Event()
+        self._run_sem = asyncio.Semaphore(_MAX_CONCURRENT_RUNS)
         self._task = asyncio.create_task(self._loop())
-        logger.info("Scheduler started, tick interval=%ds", _LOOP_INTERVAL_SEC)
+        logger.info(
+            "Scheduler started, tick=%ds, max_concurrent=%d",
+            _LOOP_INTERVAL_SEC, _MAX_CONCURRENT_RUNS,
+        )
 
     async def stop(self):
         if self._stop_event:
@@ -177,6 +196,14 @@ class SchedulerService:
         now_iso = _now_iso()
         schedules = await loop.run_in_executor(None, db.due_schedules, now_iso)
         now = datetime.now()
+        # Watchdog: reclaim slots held by runs that hung past the timeout. The
+        # run task itself enforces the timeout (asyncio.wait_for) and clears its
+        # own entry in finally; this is a backstop for a wedged event loop.
+        for sid, started in list(self._in_flight.items()):
+            if (now - started).total_seconds() > _RUN_TIMEOUT_SEC + 60:
+                logger.warning("Schedule %s: in-flight slot stuck >%ds, reclaiming",
+                               sid, _RUN_TIMEOUT_SEC)
+                self._in_flight.pop(sid, None)
         for s in schedules:
             sid = s["id"]
             if sid in self._in_flight:
@@ -197,7 +224,7 @@ class SchedulerService:
                     sid, gap, next_run,
                 )
                 continue
-            self._in_flight.add(sid)
+            self._in_flight[sid] = now
             asyncio.create_task(self._fire_scheduled(s))
 
         # Daily NAV snapshot — once per day, after market close, so the paper
@@ -226,15 +253,31 @@ class SchedulerService:
         """Fire a schedule and advance its state (next_run_at, fail_count)."""
         sid = schedule["id"]
         try:
-            # Advance next_run_at *before* the analysis so the loop won't
-            # pick up the same row again while the run is in flight.
+            # Advance next_run_at *before* the analysis (and before queueing on
+            # the semaphore) so the loop won't re-pick this row while it waits
+            # for a concurrency slot or runs.
             next_run = _compute_next_for_row(schedule)
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None, lambda: db.update_schedule(sid, next_run_at=next_run),
             )
             analysis_id = str(uuid.uuid4())
-            success = await self._run_analysis(schedule, analysis_id, advance_state=True)
+            # Throttle: only _MAX_CONCURRENT_RUNS analyses run at once; the rest
+            # wait here. Timeout guards against a single run hanging forever.
+            sem = self._run_sem
+            try:
+                if sem is not None:
+                    await sem.acquire()
+                success = await asyncio.wait_for(
+                    self._run_analysis(schedule, analysis_id, advance_state=True),
+                    timeout=_RUN_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Schedule %s: run timed out after %ds", sid, _RUN_TIMEOUT_SEC)
+                success = False
+            finally:
+                if sem is not None:
+                    sem.release()
             await loop.run_in_executor(
                 None,
                 lambda: db.record_schedule_fire(
@@ -246,7 +289,7 @@ class SchedulerService:
                 ),
             )
         finally:
-            self._in_flight.discard(sid)
+            self._in_flight.pop(sid, None)
 
     async def _run_analysis(
         self,
