@@ -147,6 +147,10 @@ activemq-data/
 # SageMath parsed files
 *.sage.py
 
+# Deployment artifacts (contain .env / built bundle — never commit)
+deploy.tar.gz
+deploy*.tar.gz
+
 # Environments
 .env
 .envrc

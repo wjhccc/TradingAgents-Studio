@@ -149,7 +149,7 @@ npm run dev
 生产环境单进程部署:前端构建一次,让后端直接托管静态产物:
 
 ```bash
-cd web/frontend && npm run build
+cd web/frontend && npx vite build   # 用 vite build 而非 npm run build:跳过 vue-tsc 类型检查,避免类型告警中断打包
 cd ../..
 tradingagents-web              # 在 http://127.0.0.1:8000/ 上提供已构建好的 UI
 ```
@@ -169,6 +169,68 @@ docker compose run --rm tradingagents
 
 > Docker 镜像面向 CLI 工作流。若需在 Docker 中跑 Web Studio,
 > 请开放 `8000` 端口,并在启动前先构建好前端。
+
+---
+
+## 🚢 部署到 1Panel(或任意 Linux 服务器)
+
+整个 Web Studio 是**单进程**:后端 FastAPI 监听 `8000`,并直接托管前端构建产物
+(`web/frontend/dist`)。前端 API 走相对路径、WebSocket 用 `location.host`,因此
+**只需把后端跑起来、同源访问即可,不要把前端拆成单独的静态站**(拆开会导致
+`/ws/` 实时推送连不上)。
+
+### 第 1 步:本地构建前端并打包
+
+服务器运行环境通常只有 Python、没有 Node,所以前端必须**在本地先构建好**再上传:
+
+```bash
+# 1) 构建前端(用 vite build,跳过类型检查)
+cd web/frontend && npx vite build && cd ../..
+
+# 2) 打一个干净的部署包(排除 venv / node_modules / 缓存 / 日志)
+#    Windows(自带 tar)/ macOS / Linux 通用:
+tar -czf deploy.tar.gz \
+  --exclude='*__pycache__*' --exclude='*.pyc' --exclude='*.log' \
+  --exclude='web/frontend/node_modules' \
+  tradingagents cli web pyproject.toml README.md .env uv.lock
+```
+
+> 上传包里**必须包含** `web/frontend/dist`(前端成品)和 `.env`(你的 Key/配置)。
+> 改过前端 `src/` 代码后,务必重新 `npx vite build` 再打包,否则线上是旧界面。
+
+### 第 2 步:1Panel「运行环境 → Python」创建
+
+把 `deploy.tar.gz` 上传到服务器并解压,然后在 1Panel 按下表填写:
+
+| 字段 | 值 |
+| --- | --- |
+| 项目目录 | 解压后**含 `pyproject.toml` 的目录** |
+| 应用 / 版本 | Python **3.12**(勿用 3.14 — akshare/pandas 可能无预编译 wheel) |
+| 启动命令 | 见下方 |
+| 端口 | `8000` → 外部 `8000` |
+| 挂载 | 宿主 `/opt/tradingagents-data` → 容器 `/data` |
+| 环境变量 | `HOME` = `/data`(让 SQLite 库与日志落到挂载卷,重建容器不丢数据)<br>**`TRADINGAGENTS_WEB_PASSWORD` = 你的强密码**(公网部署务必设置,见下) |
+
+> **🔒 一定要设访问密码!** 公网 IP 裸奔会被爬虫扫到并调用分析接口、白烧 LLM token。
+> 设了 `TRADINGAGENTS_WEB_PASSWORD` 后,打开网站浏览器会弹原生登录框,输入一次即可
+> (用户名默认 `admin`,可用 `TRADINGAGENTS_WEB_USER` 改);不设则不鉴权(仅适合 localhost)。
+> 这个变量在 1Panel「环境变量」里加最方便,改密码不用重新打包。注意纯 `http://IP:8000`
+> 下密码是明文传输,条件允许时配合域名 + HTTPS(见下)更安全。
+
+启动命令(一行):
+
+```bash
+pip install -i https://pypi.tuna.tsinghua.edu.cn/simple ".[web,cn]" && python -m uvicorn web.backend.main:app --host 0.0.0.0 --port 8000
+```
+
+部署完成后访问 `http://<服务器IP>:8000` 即为完整网站。API key 等配置由项目目录下的
+`.env` 自动加载(`tradingagents/__init__.py` 启动时 `load_dotenv`),无需在面板里逐项填写。
+
+### (可选)域名 + HTTPS
+
+若要用域名/443 访问,在 1Panel「网站 → 反向代理」指向 `127.0.0.1:8000`,
+并**开启 WebSocket 支持**(转发 `Upgrade` / `Connection` 头)——
+否则实时分析进度、选股推送会断流。
 
 ---
 
