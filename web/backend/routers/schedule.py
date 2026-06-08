@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException
 
 from .. import database as db
 from ..models import ScheduleCreate, ScheduleUpdate, ScheduleFromHoldings
-from ..scheduler import compute_next_run_at, service as scheduler_service
+from ..scheduler import compute_first_run_at, compute_next_run_at, service as scheduler_service
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +69,12 @@ async def list_all():
 @router.post("")
 async def create(req: ScheduleCreate):
     _validate_schedule_type(req)
-    next_run = compute_next_run_at(
+    next_run = compute_first_run_at(
         req.schedule_type,
         req.interval_minutes,
         req.time_of_day,
         req.day_of_week,
+        req.asset_type,
     )
     loop = asyncio.get_running_loop()
     row = await loop.run_in_executor(
@@ -162,12 +163,6 @@ async def bulk_from_holdings(req: ScheduleFromHoldings):
     active_tickers = {
         s["ticker"].upper() for s in existing if s["status"] != "disabled"
     }
-    next_run = compute_next_run_at(
-        req.schedule_type,
-        req.interval_minutes,
-        req.time_of_day,
-        req.day_of_week,
-    )
     config = {
         "max_debate_rounds": req.max_debate_rounds,
         "max_risk_discuss_rounds": req.max_risk_discuss_rounds,
@@ -184,19 +179,28 @@ async def bulk_from_holdings(req: ScheduleFromHoldings):
         if t in active_tickers:
             skipped.append(t)
             continue
+        asset_type = h.get("asset_type", "stock")
+        # Per-holding so each asset's trading session governs the immediate run.
+        next_run = compute_first_run_at(
+            req.schedule_type,
+            req.interval_minutes,
+            req.time_of_day,
+            req.day_of_week,
+            asset_type,
+        )
         await loop.run_in_executor(
             None,
-            lambda h=h, t=t: db.create_schedule(
+            lambda h=h, t=t, at=asset_type, nr=next_run: db.create_schedule(
                 name=f"持仓: {t}",
                 ticker=t,
-                asset_type=h.get("asset_type", "stock"),
+                asset_type=at,
                 schedule_type=req.schedule_type,
                 interval_minutes=req.interval_minutes,
                 time_of_day=req.time_of_day,
                 day_of_week=req.day_of_week,
                 analysts=req.analysts,
                 config=config,
-                next_run_at=next_run,
+                next_run_at=nr,
                 from_holding=True,
                 auto_trade=req.auto_trade,
                 auto_trade_cash_fraction=req.auto_trade_cash_fraction,

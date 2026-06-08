@@ -192,7 +192,7 @@ async def screen_to_schedule(run_id: str, req: ScreenToScheduleRequest):
     Tickers that already have an active schedule are skipped (no dupes),
     mirroring ``schedule.bulk_from_holdings``.
     """
-    from ..scheduler import compute_next_run_at
+    from ..scheduler import compute_first_run_at
 
     if not req.tickers:
         raise HTTPException(status_code=400, detail="未选择任何股票")
@@ -201,7 +201,9 @@ async def screen_to_schedule(run_id: str, req: ScreenToScheduleRequest):
     active_tickers = {
         s["ticker"].upper() for s in existing if s["status"] != "disabled"
     }
-    next_run = compute_next_run_at("daily", None, req.time_of_day, None)
+    # Smart catch-up: if created during a trading session after the configured
+    # time, fire the first run now instead of waiting until tomorrow.
+    next_run = compute_first_run_at("daily", None, req.time_of_day, None, req.asset_type)
     config = {
         "max_debate_rounds": req.max_debate_rounds,
         "max_risk_discuss_rounds": req.max_risk_discuss_rounds,

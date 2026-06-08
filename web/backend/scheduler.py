@@ -122,6 +122,82 @@ def _compute_next_for_row(schedule: dict, *, ref: Optional[datetime] = None) -> 
     )
 
 
+# A-share market window in minutes-from-midnight (server-local, matching
+# ``compute_next_run_at``), with the same small buffer the quote merge uses.
+# Lunch break is 11:30–13:00, during which we deliberately do NOT fire.
+_MKT_OPEN = 9 * 60 + 25            # ~09:30 open
+_MKT_MORNING_END = 11 * 60 + 32    # ~11:30 morning close
+_MKT_AFTERNOON_OPEN = 13 * 60      # 13:00 afternoon open
+_MKT_CLOSE = 15 * 60 + 5           # ~15:00 close
+
+
+def _catch_up_fire_at(asset_type: Optional[str], ref: datetime) -> Optional[datetime]:
+    """When an overdue daily/weekly schedule should first fire *today*, or None
+    to fall back to the next normal occurrence (tomorrow / next week).
+
+    Crypto runs immediately (24/7). A-shares (default): run now if in an active
+    session; during the **lunch break we do NOT run** — defer to the afternoon
+    open (13:00); before the morning open, fire at the open; after the close,
+    return None so it waits for the next day. Public holidays aren't filtered
+    (the safe direction — a holiday just means no same-day run).
+    """
+    at = (asset_type or "stock").lower()
+    if at == "crypto":
+        return ref.replace(microsecond=0)
+    if ref.weekday() >= 5:
+        return None
+    hm = ref.hour * 60 + ref.minute
+    if hm < _MKT_OPEN:                      # before open → fire at the open
+        return ref.replace(hour=9, minute=30, second=0, microsecond=0)
+    if hm <= _MKT_MORNING_END:              # morning session → now
+        return ref.replace(microsecond=0)
+    if hm < _MKT_AFTERNOON_OPEN:            # lunch break → defer to 13:00
+        return ref.replace(hour=13, minute=0, second=0, microsecond=0)
+    if hm <= _MKT_CLOSE:                    # afternoon session → now
+        return ref.replace(microsecond=0)
+    return None                             # after close → next day
+
+
+def compute_first_run_at(
+    schedule_type: str,
+    interval_minutes: Optional[int],
+    time_of_day: Optional[str],
+    day_of_week: Optional[int],
+    asset_type: Optional[str] = "stock",
+    *,
+    ref: Optional[datetime] = None,
+) -> str:
+    """First fire time at create-time, with a "smart catch-up" for daily/weekly.
+
+    Normally a daily/weekly schedule created *after* its configured time waits
+    until the next occurrence (tomorrow / next week). That surprises users who
+    add an auto-trading portfolio mid-session expecting a same-day run. So if
+    today's configured time has already passed (and, for weekly, today is the
+    configured weekday), we bring the first run forward to *today* via
+    ``_catch_up_fire_at`` — now if the market is in session, the afternoon open
+    if it's the lunch break, and not at all after the close. Recurring runs
+    after that still follow ``compute_next_run_at`` unchanged.
+    """
+    ref = ref or datetime.now()
+    normal = compute_next_run_at(
+        schedule_type, interval_minutes, time_of_day, day_of_week, ref=ref,
+    )
+    if schedule_type not in ("daily", "weekly"):
+        return normal
+    if schedule_type == "weekly" and day_of_week is not None and ref.weekday() != day_of_week:
+        return normal
+    hh, mm = _parse_hhmm(time_of_day or "09:00")
+    todays = ref.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if todays > ref:
+        return normal  # configured time still ahead today → just wait for it
+    fire = _catch_up_fire_at(asset_type, ref)
+    if fire is None:
+        return normal
+    if fire < todays:  # never fire before the configured time
+        fire = todays
+    return fire.replace(microsecond=0).isoformat()
+
+
 class SchedulerService:
     """Background loop that fires due schedules.
 
@@ -304,12 +380,24 @@ class SchedulerService:
         runs go through the same GraphRunner here, but only scheduled runs
         invoke record_schedule_fire afterwards.
         """
+        from .routers.settings import get_effective_config
+
         loop = asyncio.get_running_loop()
         analysts = json.loads(schedule["analysts"])
-        config = json.loads(schedule["config_json"])
+        # Base on the current effective config (DEFAULT_CONFIG + Settings
+        # overrides) so LLM provider/model/keys are populated, then overlay the
+        # schedule's persisted config. Only non-None stored values win: the
+        # screener / holdings "portfolio" paths persist llm_provider /
+        # deep_think_llm / quick_think_llm = None, and feeding those straight to
+        # GraphRunner gives it no LLM, which is why scheduled runs failed while
+        # manual ones (which already merge effective config) succeeded.
+        stored = json.loads(schedule["config_json"])
+        config = dict(get_effective_config())
+        for k, v in stored.items():
+            if v is not None:
+                config[k] = v
         ticker = schedule["ticker"]
         trade_date = datetime.now().strftime("%Y-%m-%d")
-        config = dict(config)
         config["_ticker"] = ticker
         config["_trade_date"] = trade_date
         try:
