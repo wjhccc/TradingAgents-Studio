@@ -679,7 +679,7 @@ def record_schedule_fire(
 
 # --- Paper trading ---
 
-def ensure_default_paper_account(initial_cash: float = 1_000_000.0) -> dict:
+def ensure_default_paper_account(initial_cash: float = 10_000.0) -> dict:
     """Create the default paper-trading account if none exists. Returns the
     sole account (creates one if the table is empty, otherwise returns the
     first one). Most users only need a single virtual account."""
