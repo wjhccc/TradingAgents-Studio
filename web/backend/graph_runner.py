@@ -89,6 +89,11 @@ class GraphRunner:
         # merged state after every node, including non-debate nodes).
         self._last_invest_response: str = ""
         self._last_risk_response: str = ""
+        # Analysts now finish inside one parallel barrier node and stream their
+        # completion individually (via on_analyst_done). The barrier's merged
+        # chunk would otherwise re-emit every analyst; track which we've already
+        # surfaced so each agent_complete fires exactly once.
+        self._emitted_agents: set = set()
 
     async def _emit(self, event_type: str, agent: str, content: str = "",
                     tokens: int = 0, extra: Optional[dict] = None):
@@ -145,8 +150,9 @@ class GraphRunner:
         seen_agents = set()
         for key in state_keys:
             agent = _NODE_AGENT_MAP.get(key) or _STATE_KEY_AGENT.get(key)
-            if agent and agent not in seen_agents:
+            if agent and agent not in seen_agents and agent not in self._emitted_agents:
                 seen_agents.add(agent)
+                self._emitted_agents.add(agent)
                 self._enqueue_from_thread({
                     "type": "agent_complete",
                     "agent": agent,

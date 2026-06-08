@@ -87,10 +87,11 @@ ANALYST_NODE_SPECS: Dict[str, AnalystNodeSpec] = {
 
 def build_analyst_execution_plan(
     selected_analysts: Iterable[str],
-    concurrency_limit: int = 1,
+    concurrency_limit: int = 0,
 ) -> AnalystExecutionPlan:
-    if concurrency_limit < 1:
-        raise ValueError("analyst concurrency limit must be >= 1")
+    # 0 means "no cap" — run every selected analyst at once. Negative is invalid.
+    if concurrency_limit < 0:
+        raise ValueError("analyst concurrency limit must be >= 0 (0 = unbounded)")
 
     specs: List[AnalystNodeSpec] = []
     for analyst_key in selected_analysts:

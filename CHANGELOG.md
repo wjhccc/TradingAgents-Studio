@@ -16,6 +16,68 @@ Breaking changes within the 0.x line are called out explicitly.
 
 _No changes yet._
 
+## [Studio 0.5.0] — 2026-06-08
+
+Concurrency overhaul. The headline change is that analysts within a single
+analysis now run **in parallel** instead of one after another, and the whole
+stack was hardened for running **many tickers at once** (batch analyze, the
+screener's "→ analyze" handoff, and interval auto-trading schedules).
+
+### Added
+
+- **Parallel analysts.** The analyst stage used to be a serial chain
+  (`Market → Sentiment → News → …`), so a 6-analyst run paid the sum of all
+  six LLM round-trips. They now fan out and run concurrently inside one graph
+  step, converging on the Bull Researcher — single-analysis wall time drops by
+  roughly 50–70% depending on how many analysts are selected. Each analyst's
+  ReAct loop runs over an isolated message workspace (`graph/analyst_runner.py`)
+  so their tool calls no longer need the old serial "Msg Clear" separation;
+  only the report keys are merged back. Per-analyst completion still streams to
+  the UI in real time, now as each one finishes rather than all at the end.
+- **Global LLM concurrency throttle + 429 backoff** (`llm_clients/throttle.py`).
+  A single process-wide semaphore caps *total* simultaneous LLM requests across
+  every analyst of every concurrently-running analysis, so a multi-ticker burst
+  can't trip the provider's rate limit. Rate-limit (HTTP 429) errors retry with
+  exponential backoff + jitter, with the backoff happening outside the
+  semaphore so a waiting retry doesn't hold a slot. Wrapped at the chat model's
+  `_generate` so it covers both direct calls and the tool-calling path without
+  disturbing callback-based token tracking.
+- **New concurrency env knobs** (documented in `.env.example`):
+  `TRADINGAGENTS_LLM_CONCURRENCY` (default 16),
+  `TRADINGAGENTS_LLM_MAX_RETRIES` (default 5), and
+  `TRADINGAGENTS_ANALYST_CONCURRENCY` (default 0 = no cap, all selected
+  analysts at once).
+
+### Changed
+
+- **`analyst_concurrency_limit` is now live.** Previously threaded through the
+  config and execution plan but never used (dead code); it now caps the analyst
+  thread pool. `0` means unbounded (run every selected analyst at once) and is
+  the new default.
+- **Web SQLite uses per-thread connection reuse** (`web/backend/database.py`).
+  Request-path DB calls run on the default executor's thread pool; each call
+  used to open a fresh connection, run `PRAGMA journal_mode=WAL`, then close.
+  WAL (a persistent DB property) is now set once at `init_db()`; connections are
+  reused per thread (keyed by DB path) with `synchronous=NORMAL` and a 30s busy
+  timeout, cutting per-call setup cost.
+
+### Fixed
+
+- **Checkpoint DB "database is locked" under concurrent same-ticker runs.** The
+  per-ticker checkpoint connection (`graph/checkpointer.py`) had no timeout and
+  no WAL, so a scheduled fire overlapping a manual trigger (or interval
+  re-fires) on the same ticker could fail outright. Now opens with WAL,
+  `synchronous=NORMAL`, and a 30s busy timeout.
+- **Background analysis tasks could be garbage-collected mid-run.** The
+  scheduler, the analyze router, and the screener spawned fire-and-forget
+  `asyncio.create_task()` without retaining the task; asyncio only holds a weak
+  reference, so a mid-flight run could be dropped by the GC. All such spawns now
+  go through a helper that keeps a strong ref until completion.
+- **Alpha Vantage fetches reuse one HTTP session** instead of opening a fresh
+  TCP/TLS connection per request — relevant now that analysts hit it from
+  multiple threads.
+
+
 ## [Studio 0.4.0] — 2026-05-22
 
 This section accumulates changes made on top of `Studio 0.3.0`. They will

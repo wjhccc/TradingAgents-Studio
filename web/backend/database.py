@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Optional
 from contextlib import contextmanager
@@ -9,6 +10,15 @@ _DB_PATH = os.getenv(
     "TRADINGAGENTS_WEB_DB",
     os.path.join(os.path.expanduser("~"), ".tradingagents", "web_state.db"),
 )
+
+# One connection per thread, reused across calls. Request-path DB work runs on
+# the default executor's thread pool (run_in_executor(None, ...)), so without
+# reuse every call paid connection-open + PRAGMA + close. Reusing keeps the
+# same SQLite isolation per call (we still commit at the end of each get_db
+# block) while dropping the per-call setup cost. WAL is a persistent DB-level
+# property set once at init_db(); per-connection we only set the cheap
+# pragmas that don't persist (busy_timeout, synchronous, foreign_keys).
+_thread_local = threading.local()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS analyses (
@@ -200,18 +210,41 @@ def _ensure_dir():
     os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
 
 
+def _get_conn() -> sqlite3.Connection:
+    """Return this thread's reused SQLite connection, creating it once.
+
+    The per-connection pragmas below are not persistent so they're set on
+    creation. WAL (a persistent DB property) is set once in init_db().
+
+    Keyed by the current ``_DB_PATH`` so that if the path changes (tests
+    monkeypatch it per case), a stale connection bound to the old DB is
+    replaced instead of silently querying the wrong file.
+    """
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None and getattr(_thread_local, "path", None) == _DB_PATH:
+        return conn
+    if conn is not None:
+        conn.close()
+    _ensure_dir()
+    conn = sqlite3.connect(_DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _thread_local.conn = conn
+    _thread_local.path = _DB_PATH
+    return conn
+
+
 @contextmanager
 def get_db():
-    _ensure_dir()
-    conn = sqlite3.connect(_DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = _get_conn()
     try:
         yield conn
         conn.commit()
-    finally:
-        conn.close()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 def _add_column_if_missing(conn, table: str, col: str, ddl: str):
@@ -227,6 +260,10 @@ def _add_column_if_missing(conn, table: str, col: str, ddl: str):
 
 def init_db():
     with get_db() as conn:
+        # WAL is a persistent DB-level property — set it once here rather than
+        # on every connection. Lets readers and the writer coexist, which the
+        # concurrent request path + background analyses rely on.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
         # Migrations for columns added after a DB was first created.
         _add_column_if_missing(conn, "schedules", "auto_trade", "INTEGER NOT NULL DEFAULT 0")

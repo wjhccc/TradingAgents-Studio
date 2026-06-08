@@ -262,6 +262,17 @@ class SchedulerService:
         # Last date (YYYY-MM-DD, server-local) we stored a NAV snapshot, so the
         # daily auto-snapshot fires at most once per calendar day.
         self._last_nav_date: Optional[str] = None
+        # Strong refs to fire-and-forget run tasks. asyncio only holds a weak
+        # ref to a bare create_task() result, so without this the GC can drop a
+        # mid-flight run. Tasks remove themselves on completion.
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn(self, coro) -> asyncio.Task:
+        """create_task that retains a strong ref until the task finishes."""
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     async def start(self):
         if self._task and not self._task.done():
@@ -294,7 +305,7 @@ class SchedulerService:
         if not schedule:
             return None
         analysis_id = str(uuid.uuid4())
-        asyncio.create_task(
+        self._spawn(
             self._run_analysis(schedule, analysis_id, advance_state=False),
         )
         return analysis_id
@@ -356,7 +367,7 @@ class SchedulerService:
                 )
                 continue
             self._in_flight[sid] = now
-            asyncio.create_task(self._fire_scheduled(s))
+            self._spawn(self._fire_scheduled(s))
 
         # Daily NAV snapshot — once per day, after market close, so the paper
         # account's equity curve updates on its own.

@@ -34,8 +34,18 @@ def thread_id(ticker: str, date: str) -> str:
 def get_checkpointer(data_dir: str | Path, ticker: str) -> Generator[SqliteSaver, None, None]:
     """Context manager yielding a SqliteSaver backed by a per-ticker DB."""
     db = _db_path(data_dir, ticker)
-    conn = sqlite3.connect(str(db), check_same_thread=False)
+    # ``timeout`` + WAL keep concurrent writers from instantly failing with
+    # "database is locked": the same ticker can be analysed by two runs at once
+    # (e.g. a scheduled fire overlapping a manual trigger, or intraday-interval
+    # re-fires), and each checkpoint write would otherwise contend. WAL lets a
+    # reader and a writer coexist; synchronous=NORMAL drops the per-txn fsync
+    # that FULL forces (safe under WAL). ``check_same_thread=False`` is required
+    # because the graph runs on a worker thread.
+    conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30)
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         saver = SqliteSaver(conn)
         saver.setup()
         yield saver
@@ -79,7 +89,7 @@ def clear_checkpoint(data_dir: str | Path, ticker: str, date: str) -> None:
     if not db.exists():
         return
     tid = thread_id(ticker, date)
-    conn = sqlite3.connect(str(db))
+    conn = sqlite3.connect(str(db), timeout=30)
     try:
         for table in ("writes", "checkpoints"):
             conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (tid,))

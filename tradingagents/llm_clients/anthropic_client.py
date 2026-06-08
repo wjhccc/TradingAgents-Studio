@@ -4,6 +4,7 @@ from typing import Any, Optional
 from langchain_anthropic import ChatAnthropic
 
 from .base_client import BaseLLMClient, normalize_content
+from .throttle import ThrottledLLMMixin
 from .validators import validate_model
 
 _PASSTHROUGH_KWARGS = (
@@ -28,7 +29,7 @@ def _supports_effort(model: str) -> bool:
     return model_lc in _EFFORT_EXACT or bool(_EFFORT_PATTERN.match(model_lc))
 
 
-class NormalizedChatAnthropic(ChatAnthropic):
+class NormalizedChatAnthropic(ThrottledLLMMixin, ChatAnthropic):
     """ChatAnthropic with normalized content output.
 
     Claude models with extended thinking or tool use return content as a

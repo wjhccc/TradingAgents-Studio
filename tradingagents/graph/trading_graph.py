@@ -125,8 +125,9 @@ class TradingAgentsGraph:
             self.deep_thinking_llm,
             self.tool_nodes,
             self.conditional_logic,
-            analyst_concurrency_limit=self.config.get("analyst_concurrency_limit", 1),
+            analyst_concurrency_limit=self.config.get("analyst_concurrency_limit", 0),
             config=self.config,
+            on_analyst_done=self._on_analyst_done,
         )
 
         self.propagator = Propagator(
@@ -144,6 +145,21 @@ class TradingAgentsGraph:
         self.workflow = self.graph_setup.setup_graph(selected_analysts)
         self.graph = self.workflow.compile()
         self._checkpointer_ctx = None
+
+    def _on_analyst_done(self, report_key: str, report_text: str) -> None:
+        """Bridge a parallel-analyst completion into ``on_node_complete``.
+
+        Fired from a worker thread inside the parallel analyst step. We forward
+        it as a single-key chunk in the same shape ``graph_runner._on_node``
+        already consumes (it maps the report state-key → agent name), so the web
+        layer streams each analyst's completion live without any extra wiring.
+        """
+        if not self.on_node_complete:
+            return
+        try:
+            self._invoke_node_callback({report_key: report_text})
+        except Exception:  # streaming is best-effort; never fail the run on it
+            pass
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""

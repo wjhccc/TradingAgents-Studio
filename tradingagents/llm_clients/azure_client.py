@@ -4,6 +4,7 @@ from typing import Any, Optional
 from langchain_openai import AzureChatOpenAI
 
 from .base_client import BaseLLMClient, normalize_content
+from .throttle import ThrottledLLMMixin
 from .validators import validate_model
 
 _PASSTHROUGH_KWARGS = (
@@ -12,7 +13,7 @@ _PASSTHROUGH_KWARGS = (
 )
 
 
-class NormalizedAzureChatOpenAI(AzureChatOpenAI):
+class NormalizedAzureChatOpenAI(ThrottledLLMMixin, AzureChatOpenAI):
     """AzureChatOpenAI with normalized content output."""
 
     def invoke(self, input, config=None, **kwargs):

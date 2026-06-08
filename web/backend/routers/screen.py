@@ -31,6 +31,17 @@ router = APIRouter(prefix="/api/screen", tags=["screen"])
 # analysis_id-style live queue map, consumed by the /ws/screen/{id} socket.
 _active_queues: dict[str, asyncio.Queue] = {}
 
+# Strong refs to fire-and-forget run tasks so the GC can't drop a mid-flight
+# run (asyncio only weakly references a bare create_task result).
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
 
 @router.post("")
 async def start_screen(req: ScreenRequest):
@@ -41,7 +52,7 @@ async def start_screen(req: ScreenRequest):
     queue = asyncio.Queue()
     _active_queues[run_id] = queue
     runner = ScreenerRunner(run_id, req.text, req.filters, req.top_n, req.use_llm, queue)
-    asyncio.create_task(_run_and_cleanup(run_id, runner))
+    _spawn(_run_and_cleanup(run_id, runner))
     return {"id": run_id, "status": "pending"}
 
 
@@ -146,7 +157,11 @@ async def screen_to_paper(run_id: str, req: ScreenToPaperRequest):
 @router.post("/{run_id}/to-analyze")
 async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
     """Kick off a deep analysis for each selected ticker. Returns their ids."""
-    from .analyze import _active_queues as analyze_queues, _run_and_cleanup as analyze_cleanup
+    from .analyze import (
+        _active_queues as analyze_queues,
+        _run_and_cleanup as analyze_cleanup,
+        _spawn as analyze_spawn,
+    )
     from ..graph_runner import GraphRunner, build_config
     from ..models import AnalyzeRequest
 
@@ -177,7 +192,7 @@ async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
         queue = asyncio.Queue()
         analyze_queues[analysis_id] = queue
         runner = GraphRunner(analysis_id, config, req.analysts, queue)
-        asyncio.create_task(analyze_cleanup(analysis_id, runner))
+        analyze_spawn(analyze_cleanup(analysis_id, runner))
         started.append({"ticker": ticker, "analysis_id": analysis_id})
 
     return {"started": started, "total": len(started)}

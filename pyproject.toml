@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tradingagents-studio"
-version = "0.4.0"
+version = "0.5.0"
 description = "TradingAgents-Studio: A web-enabled, China-extended fork of the TradingAgents multi-agent LLM trading framework (Apache 2.0)"
 readme = "README.md"
 requires-python = ">=3.10"
