@@ -158,6 +158,45 @@ def _catch_up_fire_at(asset_type: Optional[str], ref: datetime) -> Optional[date
     return None                             # after close → next day
 
 
+def _in_trading_session(asset_type: Optional[str], ref: datetime) -> bool:
+    """True if ``asset_type``'s market is in an active session right now —
+    morning or afternoon, **lunch break excluded**. Crypto is always True."""
+    at = (asset_type or "stock").lower()
+    if at == "crypto":
+        return True
+    if ref.weekday() >= 5:
+        return False
+    hm = ref.hour * 60 + ref.minute
+    return (_MKT_OPEN <= hm <= _MKT_MORNING_END) or (_MKT_AFTERNOON_OPEN <= hm <= _MKT_CLOSE)
+
+
+def _next_session_start(asset_type: Optional[str], ref: datetime) -> datetime:
+    """Next moment ``asset_type``'s market is open, at or after ``ref``.
+
+    Returns ``ref`` (to the minute) if already in session; otherwise the next
+    open: today's open / afternoon open / a following weekday's open. Used to
+    start and resume ``interval`` schedules so intraday monitoring only runs
+    during trading hours. Crypto is always open; public holidays aren't modelled.
+    """
+    at = (asset_type or "stock").lower()
+    if at == "crypto":
+        return ref.replace(second=0, microsecond=0)
+    cur = ref
+    for _ in range(8):  # at most a week ahead (skips weekends)
+        if cur.weekday() < 5:
+            hm = cur.hour * 60 + cur.minute
+            if hm < _MKT_OPEN:
+                return cur.replace(hour=9, minute=30, second=0, microsecond=0)
+            if hm <= _MKT_MORNING_END:
+                return cur.replace(second=0, microsecond=0)
+            if hm < _MKT_AFTERNOON_OPEN:
+                return cur.replace(hour=13, minute=0, second=0, microsecond=0)
+            if hm <= _MKT_CLOSE:
+                return cur.replace(second=0, microsecond=0)
+        cur = (cur + timedelta(days=1)).replace(hour=9, minute=30, second=0, microsecond=0)
+    return cur
+
+
 def compute_first_run_at(
     schedule_type: str,
     interval_minutes: Optional[int],
@@ -182,6 +221,11 @@ def compute_first_run_at(
     normal = compute_next_run_at(
         schedule_type, interval_minutes, time_of_day, day_of_week, ref=ref,
     )
+    if schedule_type == "interval":
+        # Start intraday monitoring at the next open trading moment (now if the
+        # market is already in session). The _tick gate keeps later fires inside
+        # trading hours, so we don't wait a whole interval before the first run.
+        return _next_session_start(asset_type, ref).isoformat()
     if schedule_type not in ("daily", "weekly"):
         return normal
     if schedule_type == "weekly" and day_of_week is not None and ref.weekday() != day_of_week:
@@ -298,6 +342,17 @@ class SchedulerService:
                 logger.info(
                     "Schedule %s: skipped a missed fire (gap=%.0fs), next at %s",
                     sid, gap, next_run,
+                )
+                continue
+            # Interval (intraday-monitoring) schedules only run during trading
+            # hours. If one comes due off-session — overnight, lunch break,
+            # weekend — don't fire; push next_run to the next session open so it
+            # resumes cleanly instead of burning analyses while the market's shut.
+            if s["schedule_type"] == "interval" and not _in_trading_session(s.get("asset_type"), now):
+                resume = _next_session_start(s.get("asset_type"), now).isoformat()
+                await loop.run_in_executor(
+                    None,
+                    lambda sid=sid, n=resume: db.update_schedule(sid, next_run_at=n),
                 )
                 continue
             self._in_flight[sid] = now

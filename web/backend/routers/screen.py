@@ -185,25 +185,32 @@ async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
 
 @router.post("/{run_id}/to-schedule")
 async def screen_to_schedule(run_id: str, req: ScreenToScheduleRequest):
-    """Turn the selected tickers into a daily auto-trading portfolio.
+    """Turn the selected tickers into an auto-trading portfolio.
 
-    Creates one daily schedule per ticker with ``auto_trade`` on, so each
-    runs an analysis every day and places a paper order from the decision.
-    Tickers that already have an active schedule are skipped (no dupes),
-    mirroring ``schedule.bulk_from_holdings``.
+    Creates one schedule per ticker with ``auto_trade`` on. Default frequency is
+    ``interval`` (intraday monitoring every ``interval_minutes`` — the scheduler
+    only fires interval runs during trading hours); ``daily`` runs once a day at
+    ``time_of_day``. Tickers that already have an active schedule are skipped (no
+    dupes), mirroring ``schedule.bulk_from_holdings``.
     """
     from ..scheduler import compute_first_run_at
 
     if not req.tickers:
         raise HTTPException(status_code=400, detail="未选择任何股票")
+    is_interval = req.schedule_type == "interval"
+    if is_interval and req.interval_minutes < 5:
+        raise HTTPException(status_code=400, detail="interval_minutes 不能小于 5")
     loop = asyncio.get_running_loop()
     existing = await loop.run_in_executor(None, db.list_schedules, None)
     active_tickers = {
         s["ticker"].upper() for s in existing if s["status"] != "disabled"
     }
-    # Smart catch-up: if created during a trading session after the configured
-    # time, fire the first run now instead of waiting until tomorrow.
-    next_run = compute_first_run_at("daily", None, req.time_of_day, None, req.asset_type)
+    interval_minutes = req.interval_minutes if is_interval else None
+    # First run brought forward to the next open trading moment (now if the
+    # market is already in session; interval/daily handled in compute_first_run_at).
+    next_run = compute_first_run_at(
+        req.schedule_type, interval_minutes, req.time_of_day, None, req.asset_type,
+    )
     config = {
         "max_debate_rounds": req.max_debate_rounds,
         "max_risk_discuss_rounds": req.max_risk_discuss_rounds,
@@ -226,9 +233,9 @@ async def screen_to_schedule(run_id: str, req: ScreenToScheduleRequest):
                 name=f"自动交易: {t}",
                 ticker=t,
                 asset_type=req.asset_type,
-                schedule_type="daily",
-                interval_minutes=None,
-                time_of_day=req.time_of_day,
+                schedule_type=req.schedule_type,
+                interval_minutes=interval_minutes,
+                time_of_day=None if is_interval else req.time_of_day,
                 day_of_week=None,
                 analysts=req.analysts,
                 config=config,

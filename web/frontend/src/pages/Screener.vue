@@ -106,7 +106,7 @@
           <n-button size="small" @click="batchAnalyze" :loading="analyzing">
             {{ t('screener.batchAnalyze') }}
           </n-button>
-          <n-button size="small" type="warning" @click="batchAutoTrade" :loading="addingSchedule">
+          <n-button size="small" type="warning" @click="showAutoTrade = true" :loading="addingSchedule">
             {{ t('screener.toSchedule') }}
           </n-button>
         </n-space>
@@ -146,6 +146,40 @@
           <n-button @click="showSizing = false">{{ t('common.cancel') }}</n-button>
           <n-button type="primary" :loading="addingPaper" @click="confirmAddToPaper">
             {{ t('screener.confirmBuy') }}
+          </n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
+
+    <!-- Auto-trade portfolio modal -->
+    <n-modal v-model:show="showAutoTrade" preset="card" :title="t('screener.autoTradeTitle')" style="width: 480px">
+      <n-space vertical :size="16">
+        <n-form-item :label="t('screener.autoTradeFreq')" label-placement="top">
+          <n-radio-group v-model:value="autoTradeType">
+            <n-space vertical>
+              <n-radio value="interval">{{ t('screener.autoTradeInterval') }}</n-radio>
+              <n-radio value="daily">{{ t('screener.autoTradeDaily') }}</n-radio>
+            </n-space>
+          </n-radio-group>
+        </n-form-item>
+        <n-form-item v-if="autoTradeType === 'interval'" :label="t('screener.autoTradeIntervalMin')" label-placement="top">
+          <n-input-number v-model:value="autoTradeIntervalMin" :min="5" :step="5" style="width: 100%">
+            <template #suffix>{{ t('screener.minutes') }}</template>
+          </n-input-number>
+        </n-form-item>
+        <n-form-item v-else :label="t('screener.autoTradeTimeOfDay')" label-placement="top">
+          <n-time-picker v-model:formatted-value="autoTradeTime" format="HH:mm" value-format="HH:mm" style="width: 100%" />
+        </n-form-item>
+        <n-form-item :label="t('screener.autoTradeCash')" label-placement="top">
+          <n-input-number v-model:value="autoTradeCashPct" :min="1" :max="100" :step="5" style="width: 100%">
+            <template #suffix>%</template>
+          </n-input-number>
+        </n-form-item>
+        <n-text depth="3" style="font-size: 12px">{{ t('screener.autoTradeHint') }}</n-text>
+        <n-space justify="end">
+          <n-button @click="showAutoTrade = false">{{ t('common.cancel') }}</n-button>
+          <n-button type="warning" :loading="addingSchedule" @click="confirmAutoTrade">
+            {{ t('screener.autoTradeConfirm') }}
           </n-button>
         </n-space>
       </n-space>
@@ -505,13 +539,24 @@ async function batchAnalyze() {
 // --- batch auto-trade portfolio ---
 
 const addingSchedule = ref(false)
-async function batchAutoTrade() {
+const showAutoTrade = ref(false)
+const autoTradeType = ref<'interval' | 'daily'>('interval')
+const autoTradeIntervalMin = ref(60)
+const autoTradeTime = ref<string | null>('09:30')
+const autoTradeCashPct = ref(10)
+
+async function confirmAutoTrade() {
   if (!checkedKeys.value.length) { message.warning(t('screener.emptySelect')); return }
   addingSchedule.value = true
   try {
     const { data } = await api.post(`/api/screen/${runId.value}/to-schedule`, {
       tickers: checkedKeys.value,
+      schedule_type: autoTradeType.value,
+      interval_minutes: autoTradeIntervalMin.value,
+      time_of_day: autoTradeTime.value || '09:30',
+      auto_trade_cash_fraction: Math.max(1, Math.min(100, autoTradeCashPct.value)) / 100,
     })
+    showAutoTrade.value = false
     message.success(t('screener.toScheduleDone', { created: data.created, skipped: data.skipped.length }))
     router.push('/schedule')
   } catch (e: any) {

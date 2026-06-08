@@ -208,16 +208,20 @@ class ScreenToAnalyzeRequest(BaseModel):
 
 
 class ScreenToScheduleRequest(BaseModel):
-    """One-click turn screened tickers into a daily auto-trading portfolio.
+    """One-click turn screened tickers into an auto-trading portfolio.
 
-    Creates one daily schedule per ticker with ``auto_trade`` on, so each
-    one runs an analysis every day and places a paper order from the
-    decision. Tickers that already have an active schedule are skipped.
+    Creates one schedule per ticker with ``auto_trade`` on. Default is
+    ``interval`` (intraday monitoring every ``interval_minutes``, only fired
+    during trading hours by the scheduler); pass ``schedule_type='daily'`` for
+    a once-a-day run at ``time_of_day`` instead. Tickers that already have an
+    active schedule are skipped.
     """
     tickers: list[str]
     asset_type: str = "stock"
     analysts: list[str] = ["market", "news", "fundamentals"]
-    time_of_day: str = "09:30"
+    schedule_type: str = "interval"       # 'interval' (intraday) | 'daily'
+    interval_minutes: int = 60            # used when schedule_type == 'interval'
+    time_of_day: str = "09:30"            # used when schedule_type == 'daily'
     auto_trade: bool = True
     auto_trade_cash_fraction: Optional[float] = 0.1
     max_debate_rounds: int = 1
