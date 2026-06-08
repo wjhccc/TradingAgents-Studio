@@ -165,15 +165,27 @@ tradingagents-web              # serves the built UI at http://127.0.0.1:8000/
 tradingagents
 ```
 
-**Docker (CLI workflow):**
+**Docker (Web Studio, recommended):**
 
 ```bash
-cp .env.example .env
-docker compose run --rm tradingagents
+cp .env.example .env      # set at least one LLM key
+docker compose up -d --build
+# open http://localhost:8000
 ```
 
-> The Docker image targets the CLI workflow. To run the Web Studio under
-> Docker, expose port `8000` and build the frontend before container start.
+The image installs the `[all]` extras (Web + A-share + sentiment stacks),
+serves the pre-built frontend, and publishes port `8000`. The server binds
+`0.0.0.0` and runs without autoreload inside the container (set via
+`TRADINGAGENTS_WEB_HOST` / `TRADINGAGENTS_WEB_RELOAD` in `compose`). Analysis
+data persists in the `tradingagents_data` volume across restarts.
+
+```bash
+docker compose logs -f tradingagents   # follow logs
+docker compose down                    # stop (keeps the data volume)
+```
+
+> Ollama users: `docker compose --profile ollama up -d --build` also starts a
+> local Ollama service alongside the app.
 
 ---
 
@@ -280,6 +292,13 @@ A single complete analysis (4 analysts + 1 debate round, ~5–10K input tokens
 > Numbers are rough estimates from typical Studio runs; your usage will vary
 > with analyst count, debate rounds, and report length. **All Studio data
 > sources are free** — paid keys (Tushare, Alpha Vantage) are optional.
+>
+> **Analysts run in parallel** (since `0.5.0`): the analyst stage fans out
+> instead of running one model at a time, so adding more analysts barely moves
+> wall-clock time (it's bounded by the slowest analyst, not their sum). A
+> process-wide LLM concurrency cap (`TRADINGAGENTS_LLM_CONCURRENCY`, default 16)
+> with automatic 429 backoff keeps multi-ticker batches from tripping provider
+> rate limits.
 
 ---
 

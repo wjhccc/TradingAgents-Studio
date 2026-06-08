@@ -7,9 +7,12 @@
 .DS_Store
 __pycache__
 *.egg-info
-build
-dist
+/build
+/dist
 results
 eval_results
 Dockerfile
 docker-compose.yml
+# NOTE: do NOT ignore web/frontend/dist — the backend serves the built SPA
+# from there. The anchored /dist above only excludes the Python sdist/wheel
+# output at the repo root, not the frontend bundle.
