@@ -876,11 +876,21 @@ def execute_auto_trade(
             if pos and skip_if_held:
                 return None, f"{ticker} 已持仓，不加仓"
             frac = max(0.0, min(1.0, float(cash_fraction)))
-            shares = (acct["cash"] * frac) / price
-            if db._is_a_share_ticker(ticker):
-                shares = int(shares // 100) * 100  # whole 100-share lots
+            is_a = db._is_a_share_ticker(ticker)
+            lot = 100 if is_a else 1  # A股按 100 股整手，其余按 1 股
+            budget = acct["cash"] * frac
+            raw_shares = budget / price
+            if is_a:
+                shares = int(raw_shares // 100) * 100  # whole 100-share lots
             else:
-                shares = round(shares, 2)
+                shares = round(raw_shares, 2)
+            # Small-account floor: if the cash_fraction budget can't even cover
+            # one lot but the *total* available cash can, buy a single lot so a
+            # ¥10k account still trades. The position then exceeds cash_fraction
+            # for that order — intended for tiny accounts where 1 lot is the
+            # minimum tradable unit.
+            if shares < lot and acct["cash"] + 1e-9 >= lot * price:
+                shares = lot
             if shares <= 0:
                 return None, "可用现金不足以买入 1 手，跳过"
         else:  # sell
