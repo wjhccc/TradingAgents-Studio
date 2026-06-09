@@ -16,7 +16,7 @@ Breaking changes within the 0.x line are called out explicitly.
 
 _No changes yet._
 
-## [Studio 0.5.0] — 2026-06-08
+## [Studio 0.5.0] — 2026-06-09
 
 Concurrency overhaul. The headline change is that analysts within a single
 analysis now run **in parallel** instead of one after another, and the whole
@@ -47,6 +47,13 @@ screener's "→ analyze" handoff, and interval auto-trading schedules).
   `TRADINGAGENTS_LLM_MAX_RETRIES` (default 5), and
   `TRADINGAGENTS_ANALYST_CONCURRENCY` (default 0 = no cap, all selected
   analysts at once).
+- **One-command Docker Web Studio.** The image used to run the CLI (no port, tty
+  interaction) and shipped without web deps — the frontend was even excluded by
+  `.dockerignore`, so `docker compose up` couldn't serve the UI. The container
+  now boots the Web Studio out of the box: entrypoint is
+  `python -m web.backend.run`, `pip install ".[all]"` pulls fastapi/uvicorn plus
+  the A-share/sentiment deps, port `8000` is exposed, and host/port/reload are
+  env-overridable (`docker compose up -d --build` → `localhost:8000`).
 
 ### Changed
 
@@ -76,6 +83,17 @@ screener's "→ analyze" handoff, and interval auto-trading schedules).
 - **Alpha Vantage fetches reuse one HTTP session** instead of opening a fresh
   TCP/TLS connection per request — relevant now that analysts hit it from
   multiple threads.
+- **Small accounts can now act on BUY signals.** Auto-trade's buy branch used to
+  skip the order outright when the `cash_fraction` budget couldn't afford one lot;
+  it now falls back to buying a single lot (100 shares for A-shares, 1 otherwise)
+  when total cash allows, so a ¥10k paper account still fills. Larger accounts
+  keep sizing proportionally — behaviour unchanged.
+- **Friendly LLM error messages.** Provider failures (e.g. a DeepSeek 402
+  *Insufficient Balance*, an invalid API key, a 429, or a network timeout) used
+  to surface as a raw Python traceback buried in the analyst threads. Common
+  actionable cases are now matched and prefixed with a plain-language Chinese hint
+  (top up credit / check the key / lower concurrency / check the network), with
+  the original error kept after it for debugging (`web/backend/graph_runner.py`).
 
 
 ## [Studio 0.4.0] — 2026-05-22

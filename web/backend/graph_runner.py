@@ -304,9 +304,37 @@ class GraphRunner:
 
         except Exception as e:
             logger.exception("Analysis %s failed", self.analysis_id)
-            db.update_analysis_status(self.analysis_id, "failed", error_msg=str(e))
-            await self._emit("error", "system", str(e))
+            friendly = _friendly_llm_error(e)
+            db.update_analysis_status(self.analysis_id, "failed", error_msg=friendly)
+            await self._emit("error", "system", friendly)
             return None
+
+
+def _friendly_llm_error(exc: Exception) -> str:
+    """Turn a raw LLM/API exception into a short, actionable Chinese message.
+
+    The graph buries provider errors under a long Python traceback (e.g. a
+    DeepSeek 402 ``Insufficient Balance`` surfaces as an
+    ``openai.APIStatusError`` deep in the analyst threads). Users then can't
+    tell "out of credit" from "network down". We pattern-match the common,
+    actionable cases and prepend a plain-language hint; the original message is
+    kept after it for debugging.
+    """
+    text = str(exc)
+    low = text.lower()
+    hint = None
+    if "402" in low or "insufficient balance" in low or "insufficient_quota" in low or "exceeded your current quota" in low:
+        hint = "LLM 调用失败：API 账户余额不足，请到模型服务商（如 DeepSeek / OpenAI）充值，或在「设置」里换一个有额度的模型。"
+    elif "401" in low or "invalid api key" in low or "incorrect api key" in low or "authentication" in low:
+        hint = "LLM 调用失败：API Key 无效或未配置，请在「设置」/.env 里检查对应服务商的 Key。"
+    elif "429" in low or "rate limit" in low or "too many requests" in low:
+        hint = "LLM 调用失败：触发服务商限流（429），请降低并发或稍后重试。"
+    elif "connection" in low or "timeout" in low or "timed out" in low or "connect" in low:
+        hint = "LLM 调用失败：网络连接异常，请检查服务器能否访问模型服务商（或代理设置）。"
+    if hint:
+        # Keep the raw text (trimmed) after the hint for debugging.
+        return f"{hint}\n\n原始错误：{text[:300]}"
+    return text
 
 
 def _extract_confidence(signal: str) -> Optional[float]:
