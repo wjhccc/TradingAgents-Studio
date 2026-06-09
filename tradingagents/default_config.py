@@ -107,7 +107,13 @@ DEFAULT_CONFIG = _apply_env_overrides({
     "max_debate_rounds": 1,
     "max_risk_discuss_rounds": 1,
     "max_recur_limit": 100,
-    "analyst_concurrency_limit": 1,
+    # Max analysts running concurrently inside the parallel analyst step.
+    # 0 = no cap (run every selected analyst at once). The process-wide LLM
+    # semaphore (TRADINGAGENTS_LLM_CONCURRENCY) is the real ceiling that keeps
+    # this from overwhelming the provider across concurrent multi-ticker runs.
+    "analyst_concurrency_limit": int(
+        os.getenv("TRADINGAGENTS_ANALYST_CONCURRENCY", "0")
+    ),
     # News / data fetching parameters
     # Increase for longer lookback strategies or to broaden macro coverage;
     # decrease to reduce token usage in agent prompts.

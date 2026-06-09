@@ -50,6 +50,12 @@
     <n-card>
       <n-tabs type="line" v-model:value="tab">
         <n-tab-pane name="positions" :tab="t('paper.tabs.positions')">
+          <n-space justify="end" align="center" :size="8" style="margin-bottom: 6px">
+            <n-text depth="3" style="font-size: 12px" v-if="pricesUpdatedAt">
+              {{ t('paper.pricesUpdated', { time: pricesUpdatedAt.toLocaleTimeString() }) }}
+            </n-text>
+            <n-button size="tiny" tertiary @click="refreshPrices">{{ t('paper.refreshPrices') }}</n-button>
+          </n-space>
           <n-data-table
             :columns="positionColumns"
             :data="positions"
@@ -152,11 +158,35 @@
         </n-space>
       </template>
     </n-modal>
+
+    <!-- Reset / set starting capital modal -->
+    <n-modal v-model:show="showReset" preset="card" :title="t('paper.resetTitle')" style="width: 440px">
+      <n-space vertical :size="14">
+        <n-form-item :label="t('paper.resetCashLabel')" label-placement="top">
+          <n-input-number v-model:value="resetCash" :min="0" :step="1000" style="width: 100%">
+            <template #prefix>¥</template>
+          </n-input-number>
+        </n-form-item>
+        <n-space :size="8">
+          <n-button v-for="amt in [10000, 50000, 100000, 1000000]" :key="amt" size="small"
+            :type="resetCash === amt ? 'primary' : 'default'" @click="resetCash = amt">
+            {{ amt >= 10000 ? (amt / 10000) + '万' : amt }}
+          </n-button>
+        </n-space>
+        <n-alert type="warning" :show-icon="false">{{ t('paper.resetContent') }}</n-alert>
+      </n-space>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showReset = false">{{ t('common.cancel') }}</n-button>
+          <n-button type="error" :loading="resetting" @click="doReset">{{ t('paper.resetConfirm') }}</n-button>
+        </n-space>
+      </template>
+    </n-modal>
   </n-space>
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, h } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, h } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog, NButton, NSpace, NTag } from 'naive-ui'
@@ -435,12 +465,14 @@ const orderColumns = computed(() => [
     key: 'source',
     width: 130,
     render(r: PaperOrder) {
-      if (r.source === 'decision' && r.source_analysis_id) {
+      if ((r.source === 'decision' || r.source === 'auto') && r.source_analysis_id) {
+        const label = r.source === 'auto' ? t('paper.source.auto') : t('paper.source.decision')
         return h('a', {
-          style: { color: '#3060d0', cursor: 'pointer' },
+          style: { color: r.source === 'auto' ? '#d09030' : '#3060d0', cursor: 'pointer' },
           onClick: () => router.push(`/report/${r.source_analysis_id}`),
-        }, t('paper.source.decision'))
+        }, label)
       }
+      if (r.source === 'screen') return t('paper.source.screen')
       return r.source === 'manual' ? t('paper.source.manual') : r.source
     },
   },
@@ -475,9 +507,11 @@ const chartOptions = {
 }
 
 async function loadAll() {
+  // Fast paint: account/orders/nav are instant, and positions WITHOUT prices
+  // skips the slow per-ticker quote fetch — the table shows immediately.
   const [acctRes, posRes, ordRes, navRes] = await Promise.all([
     api.get('/api/paper/account'),
-    api.get('/api/paper/positions'),
+    api.get('/api/paper/positions', { params: { with_prices: false } }),
     api.get('/api/paper/orders'),
     api.get('/api/paper/nav'),
   ])
@@ -485,6 +519,45 @@ async function loadAll() {
   positions.value = posRes.data.items || []
   orders.value = ordRes.data.items || []
   navData.value = navRes.data.items || []
+  // Then fill in live prices / P&L asynchronously; the table re-renders when
+  // they arrive. Best-effort — a quote-feed hiccup leaves the table usable.
+  refreshPrices()
+}
+
+async function refreshPrices() {
+  try {
+    const { data } = await api.get('/api/paper/positions', { params: { with_prices: true } })
+    positions.value = data.items || []
+    pricesUpdatedAt.value = new Date()
+  } catch {
+    /* non-fatal: table already shown without live prices */
+  }
+}
+
+// --- intraday auto-refresh: re-pull live prices every 20s so P&L moves on
+// its own during A-share trading hours, without the user hammering refresh.
+const pricesUpdatedAt = ref<Date | null>(null)
+let priceTimer: number | null = null
+
+function aShareTradingNow(): boolean {
+  // Browser-local time; users of this UI are in CST in practice.
+  const now = new Date()
+  if (now.getDay() === 0 || now.getDay() === 6) return false
+  const hm = now.getHours() * 60 + now.getMinutes()
+  return (hm >= 9 * 60 + 25 && hm <= 11 * 60 + 32)
+      || (hm >= 12 * 60 + 58 && hm <= 15 * 60 + 5)
+}
+
+function startPriceAutoRefresh() {
+  stopPriceAutoRefresh()
+  priceTimer = window.setInterval(() => {
+    // Outside trading hours prices don't move — skip the request entirely.
+    if (aShareTradingNow()) refreshPrices()
+  }, 20_000)
+}
+
+function stopPriceAutoRefresh() {
+  if (priceTimer) { window.clearInterval(priceTimer); priceTimer = null }
 }
 
 function openOrder() {
@@ -534,23 +607,38 @@ async function takeSnapshot() {
   }
 }
 
+const showReset = ref(false)
+const resetting = ref(false)
+const resetCash = ref(10000)
+
 function confirmReset() {
-  dialog.warning({
-    title: t('paper.resetTitle'),
-    content: t('paper.resetContent'),
-    positiveText: t('paper.resetConfirm'),
-    negativeText: t('common.cancel'),
-    onPositiveClick: async () => {
-      try {
-        await api.post('/api/paper/account/reset', { confirm: true })
-        message.success(t('paper.msg.reset'))
-        await loadAll()
-      } catch (e: any) {
-        message.error(t('paper.msg.resetFailed') + (e?.response?.data?.detail || e?.message || t('common.unknownError')))
-      }
-    },
-  })
+  // Pre-fill with the current starting capital so the user sees what they're
+  // changing from; default to ¥10,000 if unknown.
+  resetCash.value = account.value?.initial_cash || 10000
+  showReset.value = true
 }
 
-onMounted(loadAll)
+async function doReset() {
+  resetting.value = true
+  try {
+    await api.post('/api/paper/account/reset', {
+      confirm: true,
+      initial_cash: resetCash.value && resetCash.value > 0 ? resetCash.value : undefined,
+    })
+    showReset.value = false
+    message.success(t('paper.msg.reset'))
+    await loadAll()
+  } catch (e: any) {
+    message.error(t('paper.msg.resetFailed') + (e?.response?.data?.detail || e?.message || t('common.unknownError')))
+  } finally {
+    resetting.value = false
+  }
+}
+
+onMounted(() => {
+  loadAll()
+  startPriceAutoRefresh()
+})
+
+onUnmounted(stopPriceAutoRefresh)
 </script>

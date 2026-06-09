@@ -78,6 +78,22 @@
             <n-text depth="3">{{ t('schedule.fields.riskDebate') }}</n-text>
           </n-space>
         </n-form-item>
+        <n-form-item :label="t('schedule.fields.autoTrade')">
+          <n-space vertical :size="4" style="width: 100%">
+            <n-switch v-model:value="form.auto_trade" />
+            <n-text depth="3" style="font-size: 12px">{{ t('schedule.fields.autoTradeHint') }}</n-text>
+          </n-space>
+        </n-form-item>
+        <n-form-item v-if="form.auto_trade" :label="t('schedule.fields.autoTradeCashPct')">
+          <n-input-number
+            v-model:value="form.auto_trade_cash_pct"
+            :min="1"
+            :max="100"
+            :step="5"
+          >
+            <template #suffix>%</template>
+          </n-input-number>
+        </n-form-item>
       </n-form>
       <template #footer>
         <n-space justify="end">
@@ -95,6 +111,7 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog, NButton, NSpace, NTag, NText } from 'naive-ui'
 import api from '../api'
+import { formatDateTime } from '../utils/datetime'
 
 interface Schedule {
   id: number
@@ -113,6 +130,8 @@ interface Schedule {
   last_analysis_id: string | null
   next_run_at: string
   from_holding: number
+  auto_trade: number
+  auto_trade_cash_fraction: number | null
 }
 
 const { t } = useI18n()
@@ -137,6 +156,8 @@ const form = reactive({
   analysts: ['market', 'news', 'fundamentals'] as string[],
   max_debate_rounds: 1,
   max_risk_discuss_rounds: 1,
+  auto_trade: false,
+  auto_trade_cash_pct: 10,
 })
 
 const DOW_KEYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'] as const
@@ -163,8 +184,10 @@ function describePattern(s: Schedule): string {
 }
 
 function formatDate(s: string | null): string {
+  // Was a raw ISO slice (UTC, off by the local offset). Use the shared
+  // local-time formatter and trim the seconds for a compact schedule cell.
   if (!s) return '—'
-  return s.replace('T', ' ').slice(0, 16)
+  return formatDateTime(s).slice(0, 16)
 }
 
 const columns = computed(() => [
@@ -173,8 +196,17 @@ const columns = computed(() => [
   {
     title: t('schedule.cols.trigger'),
     key: 'pattern',
-    width: 130,
-    render(r: Schedule) { return describePattern(r) },
+    width: 160,
+    render(r: Schedule) {
+      const parts: any[] = [describePattern(r)]
+      if (r.auto_trade) {
+        parts.push(
+          h(NTag, { size: 'tiny', type: 'warning', bordered: false, style: { marginLeft: '6px' } },
+            () => t('schedule.autoTradeBadge')),
+        )
+      }
+      return h(NSpace, { size: 2, align: 'center', wrapItem: false }, () => parts)
+    },
   },
   {
     title: t('schedule.cols.analysts'),
@@ -250,6 +282,8 @@ function openCreate() {
   form.analysts = ['market', 'news', 'fundamentals']
   form.max_debate_rounds = 1
   form.max_risk_discuss_rounds = 1
+  form.auto_trade = false
+  form.auto_trade_cash_pct = 10
   showEdit.value = true
 }
 
@@ -279,6 +313,8 @@ async function save() {
       analysts: form.analysts,
       max_debate_rounds: form.max_debate_rounds,
       max_risk_discuss_rounds: form.max_risk_discuss_rounds,
+      auto_trade: form.auto_trade,
+      auto_trade_cash_fraction: form.auto_trade ? form.auto_trade_cash_pct / 100 : null,
     }
     await api.post('/api/schedules', payload)
     message.success(t('schedule.msg.created'))

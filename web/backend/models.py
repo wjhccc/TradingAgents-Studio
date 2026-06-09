@@ -94,6 +94,11 @@ class ScheduleCreate(BaseModel):
     deep_think_llm: Optional[str] = None
     quick_think_llm: Optional[str] = None
     output_language: Optional[str] = None
+    # When True, after each scheduled analysis completes the engine places a
+    # paper-trading order from its decision (BUY→buy if not held, SELL→flatten).
+    auto_trade: bool = False
+    # Fraction of available cash to spend per BUY signal (0..1). None ⇒ 0.1.
+    auto_trade_cash_fraction: Optional[float] = 0.1
 
 
 class ScheduleUpdate(BaseModel):
@@ -104,6 +109,8 @@ class ScheduleUpdate(BaseModel):
     day_of_week: Optional[int] = None
     analysts: Optional[list[str]] = None
     status: Optional[str] = None  # 'active' | 'paused' | 'disabled'
+    auto_trade: Optional[bool] = None
+    auto_trade_cash_fraction: Optional[float] = None
 
 
 class ScheduleFromHoldings(BaseModel):
@@ -115,6 +122,8 @@ class ScheduleFromHoldings(BaseModel):
     analysts: list[str] = ["market", "news", "fundamentals"]
     max_debate_rounds: int = 1
     max_risk_discuss_rounds: int = 1
+    auto_trade: bool = False
+    auto_trade_cash_fraction: Optional[float] = 0.1
 
 
 class PaperOrderRequest(BaseModel):
@@ -153,6 +162,10 @@ class PaperOrderFromDecision(BaseModel):
 
 class PaperAccountReset(BaseModel):
     confirm: bool = False
+    # Optional new starting capital (本金). When set (>0), the account's
+    # initial_cash is updated to this and cash reset to it; when omitted, the
+    # existing initial_cash is reused. Lets the user run with, say, ¥10,000.
+    initial_cash: Optional[float] = None
 
 
 class ScreenRequest(BaseModel):
@@ -192,6 +205,27 @@ class ScreenToAnalyzeRequest(BaseModel):
     asset_type: str = "stock"
     analysts: list[str] = ["market", "news", "fundamentals"]
     trade_date: Optional[str] = None  # YYYY-MM-DD; defaults to today
+
+
+class ScreenToScheduleRequest(BaseModel):
+    """One-click turn screened tickers into an auto-trading portfolio.
+
+    Creates one schedule per ticker with ``auto_trade`` on. Default is
+    ``interval`` (intraday monitoring every ``interval_minutes``, only fired
+    during trading hours by the scheduler); pass ``schedule_type='daily'`` for
+    a once-a-day run at ``time_of_day`` instead. Tickers that already have an
+    active schedule are skipped.
+    """
+    tickers: list[str]
+    asset_type: str = "stock"
+    analysts: list[str] = ["market", "news", "fundamentals"]
+    schedule_type: str = "interval"       # 'interval' (intraday) | 'daily'
+    interval_minutes: int = 60            # used when schedule_type == 'interval'
+    time_of_day: str = "09:30"            # used when schedule_type == 'daily'
+    auto_trade: bool = True
+    auto_trade_cash_fraction: Optional[float] = 0.1
+    max_debate_rounds: int = 1
+    max_risk_discuss_rounds: int = 1
 
 
 class BacktestRunRequest(BaseModel):

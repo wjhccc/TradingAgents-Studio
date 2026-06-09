@@ -27,6 +27,7 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import { NButton, NTag, NSpace, useDialog } from 'naive-ui'
 import api from '../api'
+import { formatDateTime } from '../utils/datetime'
 
 const { t } = useI18n()
 const router = useRouter()
@@ -57,7 +58,7 @@ const columns = computed(() => [
     render: (row: any) => h(NTag, { type: signalType(row.signal), size: 'small' }, () => row.signal || row.status),
   },
   { title: t('history.cols.confidence'), key: 'confidence', width: 80, render: (row: any) => row.confidence ? `${row.confidence}%` : '-' },
-  { title: t('history.cols.createdAt'), key: 'created_at', width: 180 },
+  { title: t('history.cols.createdAt'), key: 'created_at', width: 180, render: (row: any) => formatDateTime(row.created_at) },
   {
     title: t('history.cols.actions'), key: 'actions', width: 150,
     render: (row: any) => h(NSpace, { size: 'small' }, () => [

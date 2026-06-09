@@ -5,9 +5,9 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.default_config import DEFAULT_CONFIG
 
 from . import database as db
+from .executors import heavy_executor, analysis_semaphore
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,11 @@ class GraphRunner:
         # merged state after every node, including non-debate nodes).
         self._last_invest_response: str = ""
         self._last_risk_response: str = ""
+        # Analysts now finish inside one parallel barrier node and stream their
+        # completion individually (via on_analyst_done). The barrier's merged
+        # chunk would otherwise re-emit every analyst; track which we've already
+        # surfaced so each agent_complete fires exactly once.
+        self._emitted_agents: set = set()
 
     async def _emit(self, event_type: str, agent: str, content: str = "",
                     tokens: int = 0, extra: Optional[dict] = None):
@@ -145,8 +150,9 @@ class GraphRunner:
         seen_agents = set()
         for key in state_keys:
             agent = _NODE_AGENT_MAP.get(key) or _STATE_KEY_AGENT.get(key)
-            if agent and agent not in seen_agents:
+            if agent and agent not in seen_agents and agent not in self._emitted_agents:
                 seen_agents.add(agent)
+                self._emitted_agents.add(agent)
                 self._enqueue_from_thread({
                     "type": "agent_complete",
                     "agent": agent,
@@ -231,16 +237,26 @@ class GraphRunner:
         return None
 
     async def run(self) -> Optional[tuple]:
-        """Run analysis in a thread pool, streaming node events via the queue."""
+        """Run analysis, streaming node events via the queue.
+
+        Gated by ``analysis_semaphore`` and executed on the dedicated
+        ``heavy_executor`` so concurrent/batch runs queue here instead of
+        pinning the default executor and freezing the request path. A queued
+        run stays ``pending`` until a slot frees.
+        """
+        self._loop = asyncio.get_running_loop()
+        async with analysis_semaphore():
+            return await self._run_guarded()
+
+    async def _run_guarded(self) -> Optional[tuple]:
         ticker = self.config["_ticker"]
         trade_date = self.config["_trade_date"]
 
         db.update_analysis_status(self.analysis_id, "running")
         await self._emit("agent_start", "system", f"Starting analysis for {ticker} on {trade_date}")
 
-        self._loop = asyncio.get_running_loop()
         try:
-            final_state, signal = await self._loop.run_in_executor(None, self._run_sync)
+            final_state, signal = await self._loop.run_in_executor(heavy_executor, self._run_sync)
 
             # Extract and store reports
             for key, (agent_name, report_type) in _REPORT_KEYS.items():
@@ -288,9 +304,37 @@ class GraphRunner:
 
         except Exception as e:
             logger.exception("Analysis %s failed", self.analysis_id)
-            db.update_analysis_status(self.analysis_id, "failed", error_msg=str(e))
-            await self._emit("error", "system", str(e))
+            friendly = _friendly_llm_error(e)
+            db.update_analysis_status(self.analysis_id, "failed", error_msg=friendly)
+            await self._emit("error", "system", friendly)
             return None
+
+
+def _friendly_llm_error(exc: Exception) -> str:
+    """Turn a raw LLM/API exception into a short, actionable Chinese message.
+
+    The graph buries provider errors under a long Python traceback (e.g. a
+    DeepSeek 402 ``Insufficient Balance`` surfaces as an
+    ``openai.APIStatusError`` deep in the analyst threads). Users then can't
+    tell "out of credit" from "network down". We pattern-match the common,
+    actionable cases and prepend a plain-language hint; the original message is
+    kept after it for debugging.
+    """
+    text = str(exc)
+    low = text.lower()
+    hint = None
+    if "402" in low or "insufficient balance" in low or "insufficient_quota" in low or "exceeded your current quota" in low:
+        hint = "LLM 调用失败：API 账户余额不足，请到模型服务商（如 DeepSeek / OpenAI）充值，或在「设置」里换一个有额度的模型。"
+    elif "401" in low or "invalid api key" in low or "incorrect api key" in low or "authentication" in low:
+        hint = "LLM 调用失败：API Key 无效或未配置，请在「设置」/.env 里检查对应服务商的 Key。"
+    elif "429" in low or "rate limit" in low or "too many requests" in low:
+        hint = "LLM 调用失败：触发服务商限流（429），请降低并发或稍后重试。"
+    elif "connection" in low or "timeout" in low or "timed out" in low or "connect" in low:
+        hint = "LLM 调用失败：网络连接异常，请检查服务器能否访问模型服务商（或代理设置）。"
+    if hint:
+        # Keep the raw text (trimmed) after the hint for debugging.
+        return f"{hint}\n\n原始错误：{text[:300]}"
+    return text
 
 
 def _extract_confidence(signal: str) -> Optional[float]:
@@ -310,8 +354,19 @@ def _extract_signal_direction(signal: str) -> str:
 
 
 def build_config(req) -> dict:
-    """Build a config dict from an AnalyzeRequest, merging with defaults."""
-    config = DEFAULT_CONFIG.copy()
+    """Build a config dict from an AnalyzeRequest, merging with effective config.
+
+    Base is ``get_effective_config()`` — DEFAULT_CONFIG plus the in-memory
+    overrides the settings page applies at runtime — NOT a bare
+    ``DEFAULT_CONFIG.copy()``. DEFAULT_CONFIG is a snapshot frozen at process
+    import, so it misses a provider/model the user switched to after startup;
+    using it here meant the LLM pre-flight (which reads the effective config)
+    passed on deepseek while the graph was built on stale openai and failed.
+    Explicit request fields still win over both.
+    """
+    from .routers.settings import get_effective_config
+
+    config = dict(get_effective_config())
     if req.llm_provider:
         config["llm_provider"] = req.llm_provider
     if req.deep_think_llm:

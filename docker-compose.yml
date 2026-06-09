@@ -3,10 +3,16 @@ services:
     build: .
     env_file:
       - .env
+    environment:
+      # In a container the server must bind 0.0.0.0 (not 127.0.0.1) to be
+      # reachable through the published port, and reload must be off.
+      - TRADINGAGENTS_WEB_HOST=0.0.0.0
+      - TRADINGAGENTS_WEB_RELOAD=0
+    ports:
+      - "8000:8000"
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
-    tty: true
-    stdin_open: true
+    restart: unless-stopped
 
   ollama:
     image: ollama/ollama:latest
@@ -21,12 +27,15 @@ services:
       - .env
     environment:
       - TRADINGAGENTS_LLM_PROVIDER=ollama
+      - TRADINGAGENTS_WEB_HOST=0.0.0.0
+      - TRADINGAGENTS_WEB_RELOAD=0
+    ports:
+      - "8000:8000"
     volumes:
       - tradingagents_data:/home/appuser/.tradingagents
     depends_on:
       - ollama
-    tty: true
-    stdin_open: true
+    restart: unless-stopped
     profiles:
       - ollama
 

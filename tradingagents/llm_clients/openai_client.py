@@ -7,10 +7,11 @@ from langchain_openai import ChatOpenAI
 from .api_key_env import get_api_key_env
 from .base_client import BaseLLMClient, normalize_content
 from .capabilities import get_capabilities
+from .throttle import ThrottledLLMMixin
 from .validators import validate_model
 
 
-class NormalizedChatOpenAI(ChatOpenAI):
+class NormalizedChatOpenAI(ThrottledLLMMixin, ChatOpenAI):
     """ChatOpenAI with normalized content output and capability-aware binding.
 
     The Responses API returns content as a list of typed blocks

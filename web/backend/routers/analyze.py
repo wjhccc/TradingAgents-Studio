@@ -13,6 +13,18 @@ router = APIRouter(prefix="/api", tags=["analyze"])
 # In-memory map of analysis_id → asyncio.Queue for active runs
 _active_queues: dict[str, asyncio.Queue] = {}
 
+# Strong refs to fire-and-forget run tasks. asyncio holds only a weak ref to a
+# bare create_task() result, so without this a mid-flight analysis could be
+# garbage-collected. Tasks discard themselves on completion.
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
 
 @router.post("/parse-query")
 async def parse_nl_query(req: NLQueryRequest):
@@ -54,10 +66,18 @@ async def parse_nl_query(req: NLQueryRequest):
 
 @router.post("/analyze")
 async def start_analysis(req: AnalyzeRequest):
+    loop = asyncio.get_running_loop()
+
+    # Analysis needs an LLM with no fallback — fail fast with a clear message
+    # instead of creating a row that dies deep in the graph on a missing key.
+    from ..llm_health import check_llm_ready
+    err = await loop.run_in_executor(None, check_llm_ready)
+    if err:
+        raise HTTPException(status_code=400, detail=f"LLM 未就绪，无法启动分析：{err}")
+
     analysis_id = str(uuid.uuid4())
     config = build_config(req)
 
-    loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, lambda: db.create_analysis(
         id=analysis_id,
         ticker=req.ticker,
@@ -71,7 +91,7 @@ async def start_analysis(req: AnalyzeRequest):
     _active_queues[analysis_id] = queue
 
     runner = GraphRunner(analysis_id, config, req.analysts, queue)
-    asyncio.create_task(_run_and_cleanup(analysis_id, runner))
+    _spawn(_run_and_cleanup(analysis_id, runner))
 
     return {"id": analysis_id, "status": "pending"}
 

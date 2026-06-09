@@ -17,6 +17,20 @@
           {{ running ? t('screener.running') : t('screener.start') }}
         </n-button>
       </n-input-group>
+      <!-- Strategy mode presets: each sets momentum direction + buyable filter -->
+      <n-space style="margin-top: 10px" :size="8" align="center">
+        <n-text depth="3" strong>{{ t('screener.modeLabel') }}:</n-text>
+        <n-button-group>
+          <n-tooltip v-for="m in modeOptions" :key="m.value">
+            <template #trigger>
+              <n-button size="small" :type="activeMode === m.value ? 'primary' : 'default'"
+                @click="setMode(m.value)">{{ m.label }}</n-button>
+            </template>
+            {{ m.hint }}
+          </n-tooltip>
+        </n-button-group>
+      </n-space>
+
       <n-space style="margin-top: 10px" :size="12" align="center">
         <n-text depth="3">{{ t('screener.topN') }}:</n-text>
         <n-button-group size="tiny">
@@ -24,9 +38,14 @@
             :type="topN === p ? 'primary' : 'default'" @click="topN = p">{{ p }}</n-button>
         </n-button-group>
         <n-checkbox v-model:checked="useLlm">{{ t('screener.useLlm') }}</n-checkbox>
+        <n-tooltip>
+          <template #trigger>
+            <n-checkbox v-model:checked="mainBoardOnly">{{ t('screener.mainBoardOnly') }}</n-checkbox>
+          </template>
+          {{ t('screener.mainBoardOnlyHint') }}
+        </n-tooltip>
         <n-text depth="3">{{ t('screener.momentumPeriod') }}:</n-text>
         <n-select v-model:value="momentumPeriod" :options="periodOptions" size="small" style="width: 150px" />
-        <n-select v-model:value="momentumDirection" :options="directionOptions" size="small" style="width: 160px" />
         <n-button size="small" secondary type="info" @click="openHistory">
           📋 {{ historyItems.length ? t('screener.historyCount', { n: historyItems.length }) : t('screener.history') }}
         </n-button>
@@ -87,6 +106,9 @@
           <n-button size="small" @click="batchAnalyze" :loading="analyzing">
             {{ t('screener.batchAnalyze') }}
           </n-button>
+          <n-button size="small" type="warning" @click="showAutoTrade = true" :loading="addingSchedule">
+            {{ t('screener.toSchedule') }}
+          </n-button>
         </n-space>
       </template>
 
@@ -100,6 +122,9 @@
         size="small"
       />
       <n-empty v-if="!candidates.length && !running" :description="t('screener.noData')" style="padding: 28px" />
+      <n-text v-if="candidates.length" depth="3" style="font-size: 11px; display: block; margin-top: 10px">
+        ⚠ {{ t('screener.actionDisclaimer') }}
+      </n-text>
     </n-card>
 
     <!-- Sizing modal -->
@@ -126,15 +151,67 @@
       </n-space>
     </n-modal>
 
+    <!-- Auto-trade portfolio modal -->
+    <n-modal v-model:show="showAutoTrade" preset="card" :title="t('screener.autoTradeTitle')" style="width: 480px">
+      <n-space vertical :size="16">
+        <n-form-item :label="t('screener.autoTradeFreq')" label-placement="top">
+          <n-radio-group v-model:value="autoTradeType">
+            <n-space vertical>
+              <n-radio value="interval">{{ t('screener.autoTradeInterval') }}</n-radio>
+              <n-radio value="daily">{{ t('screener.autoTradeDaily') }}</n-radio>
+            </n-space>
+          </n-radio-group>
+        </n-form-item>
+        <n-form-item v-if="autoTradeType === 'interval'" :label="t('screener.autoTradeIntervalMin')" label-placement="top">
+          <n-input-number v-model:value="autoTradeIntervalMin" :min="5" :step="5" style="width: 100%">
+            <template #suffix>{{ t('screener.minutes') }}</template>
+          </n-input-number>
+        </n-form-item>
+        <n-form-item v-else :label="t('screener.autoTradeTimeOfDay')" label-placement="top">
+          <n-time-picker v-model:formatted-value="autoTradeTime" format="HH:mm" value-format="HH:mm" style="width: 100%" />
+        </n-form-item>
+        <n-form-item :label="t('screener.autoTradeCash')" label-placement="top">
+          <n-input-number v-model:value="autoTradeCashPct" :min="1" :max="100" :step="5" style="width: 100%">
+            <template #suffix>%</template>
+          </n-input-number>
+        </n-form-item>
+        <n-text depth="3" style="font-size: 12px">{{ t('screener.autoTradeHint') }}</n-text>
+        <n-space justify="end">
+          <n-button @click="showAutoTrade = false">{{ t('common.cancel') }}</n-button>
+          <n-button type="warning" :loading="addingSchedule" @click="confirmAutoTrade">
+            {{ t('screener.autoTradeConfirm') }}
+          </n-button>
+        </n-space>
+      </n-space>
+    </n-modal>
+
     <!-- History drawer -->
     <n-drawer v-model:show="showHistory" :width="420">
       <n-drawer-content :title="t('screener.history')" closable>
         <n-empty v-if="!historyItems.length" :description="t('screener.historyEmpty')" />
-        <n-list v-else hoverable clickable>
-          <n-list-item v-for="h in historyItems" :key="h.id" @click="loadHistory(h.id)">
-            <n-thing :title="h.text || t('screener.noData')">
+        <template v-else>
+          <n-space justify="space-between" align="center" style="margin-bottom: 10px">
+            <n-checkbox :checked="allSelected" :indeterminate="someSelected"
+              @update:checked="toggleSelectAll">{{ t('screener.selectAll') }}</n-checkbox>
+            <n-button v-if="selectedHistory.length" size="small" type="error" secondary
+              @click="confirmBatchDelete">
+              {{ t('screener.batchDelete', { n: selectedHistory.length }) }}
+            </n-button>
+          </n-space>
+          <n-list hoverable clickable>
+            <n-list-item v-for="h in historyItems" :key="h.id">
+              <template #prefix>
+                <n-checkbox :checked="selectedHistory.includes(h.id)"
+                  @update:checked="(v: boolean) => toggleSelect(h.id, v)" @click.stop />
+              </template>
+            <n-thing :title="h.text || t('screener.noData')" style="cursor: pointer"
+              @click="loadHistory(h.id)">
               <template #header-extra>
-                <n-tag v-if="h.id === runId" size="tiny" type="info" :bordered="false">●</n-tag>
+                <n-space :size="6" align="center">
+                  <n-tag v-if="h.id === runId" size="tiny" type="info" :bordered="false">●</n-tag>
+                  <n-button text type="error" size="tiny" :title="t('common.delete')"
+                    @click.stop="confirmDelete(h)">🗑</n-button>
+                </n-space>
               </template>
               <template #description>
                 <n-space :size="6" align="center">
@@ -143,8 +220,9 @@
                 </n-space>
               </template>
             </n-thing>
-          </n-list-item>
-        </n-list>
+            </n-list-item>
+          </n-list>
+        </template>
       </n-drawer-content>
     </n-drawer>
   </n-space>
@@ -154,18 +232,25 @@
 import { ref, reactive, computed, h, watch, onMounted } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
-import { NText, NTag, NTooltip, NSpace, useMessage } from 'naive-ui'
+import { NText, NTag, NTooltip, NSpace, useMessage, useDialog } from 'naive-ui'
 import api from '../api'
 
 const { t } = useI18n()
 const router = useRouter()
 const message = useMessage()
+const dialog = useDialog()
 
 const goal = ref('')
 const topN = ref(20)
 const useLlm = ref(true)
+// Default ON: surface only barrier-free 沪深主板 names an ordinary account can
+// trade (excludes 创业板/科创板/北交所 + ST). Uncheck to include all boards.
+const mainBoardOnly = ref(true)
 const momentumPeriod = ref('today')
+// momentumDirection + buyableOnly are driven by the strategy-mode presets
+// below. Default = '强势追涨' (top gainers, like the original 涨幅榜).
 const momentumDirection = ref('up')
+const buyableOnly = ref(false)
 const filters = reactive<Record<string, any>>({
   pe_max: null, pb_max: null, market_cap_min: null, market_cap_max: null, sector_query: null,
 })
@@ -177,10 +262,27 @@ const periodOptions = computed(() => [
   { label: t('screener.period60d'), value: '60d' },
   { label: t('screener.periodYtd'), value: 'ytd' },
 ])
-const directionOptions = computed(() => [
-  { label: t('screener.directionUp'), value: 'up' },
-  { label: t('screener.directionDown'), value: 'down' },
+// Strategy-mode presets. Each is just a (direction, buyableOnly) combination,
+// surfaced as one-click buttons so the user picks intent, not raw knobs.
+//   strong   — 强势追涨: top gainers incl. 涨停 (the original 涨幅榜)
+//   buyable  — 可买入:   excludes 涨停/高位/杀跌, adds buy/sell plan
+//   oversold — 超跌反弹: biggest losers for a rebound (抄底)
+const modeOptions = computed(() => [
+  { value: 'strong', label: t('screener.modeStrong'), hint: t('screener.modeStrongHint') },
+  { value: 'buyable', label: t('screener.modeBuyable'), hint: t('screener.modeBuyableHint') },
+  { value: 'oversold', label: t('screener.modeOversold'), hint: t('screener.modeOversoldHint') },
 ])
+
+const activeMode = computed(() => {
+  if (momentumDirection.value === 'down') return 'oversold'
+  return buyableOnly.value ? 'buyable' : 'strong'
+})
+
+function setMode(m: string) {
+  if (m === 'strong') { momentumDirection.value = 'up'; buyableOnly.value = false }
+  else if (m === 'buyable') { momentumDirection.value = 'up'; buyableOnly.value = true }
+  else if (m === 'oversold') { momentumDirection.value = 'down'; buyableOnly.value = false }
+}
 
 const running = ref(false)
 const runId = ref('')
@@ -207,6 +309,8 @@ function cleanFilters(): Record<string, any> {
   }
   out.momentum_period = momentumPeriod.value
   out.momentum_direction = momentumDirection.value
+  if (mainBoardOnly.value) out.main_board_only = true
+  if (buyableOnly.value) out.buyable_only = true
   return out
 }
 
@@ -321,6 +425,42 @@ const columns = computed<any[]>(() => [
     }),
   },
   {
+    title: t('screener.columns.action'), key: 'action', width: 150,
+    render: (r: any) => {
+      const s = r.signal
+      if (!s || !s.action) return '-'
+      const typeMap: Record<string, any> = {
+        good: 'success', watch: 'info', warn: 'warning', avoid: 'error',
+      }
+      const timingMap: Record<string, string> = {
+        today: t('screener.timingToday'),
+        tomorrow: t('screener.timingTomorrow'),
+        wait: t('screener.timingWait'),
+      }
+      const p = s.plan
+      return h(NTooltip, { style: 'max-width: 340px' }, {
+        trigger: () => h(NSpace, { size: 3, vertical: true, align: 'start' }, () => [
+          h(NTag, { size: 'small', type: typeMap[s.level] || 'default', bordered: false }, () => s.action),
+          h(NSpace, { size: 4, align: 'center' }, () => [
+            h(NTag, { size: 'tiny', bordered: false, round: true,
+              type: s.timing === 'wait' ? 'default' : 'info' }, () => timingMap[s.timing] || ''),
+            h(NText, { depth: 3, style: 'font-size:11px' },
+              () => s.buyable ? t('screener.buyable') : t('screener.notBuyable')),
+          ]),
+        ]),
+        default: () => h(NSpace, { size: 4, vertical: true }, () => [
+          h(NText, null, () => s.note || ''),
+          p ? h(NText, { strong: true, style: 'font-size:12px' },
+            () => `🟢 ${t('screener.planBuy')}: ${p.when_buy}`) : null,
+          p ? h(NText, { strong: true, style: 'font-size:12px' },
+            () => `🔴 ${t('screener.planSell')}: ${p.when_sell}`) : null,
+          p ? h(NText, { depth: 3, style: 'font-size:12px' },
+            () => `${t('screener.planEntry')} ${p.entry_low}~${p.entry_high} · ${t('screener.planStop')} ${p.stop} · ${t('screener.planTarget')} ${p.target}`) : null,
+        ]),
+      })
+    },
+  },
+  {
     title: t('screener.columns.reason'), key: 'reason',
     render: (r: any) => h(NSpace, { size: 4, vertical: true }, () => [
       h(NSpace, { size: 4, align: 'center' }, () => [
@@ -396,10 +536,91 @@ async function batchAnalyze() {
   }
 }
 
-// --- history ---
+// --- batch auto-trade portfolio ---
 
+const addingSchedule = ref(false)
+const showAutoTrade = ref(false)
+const autoTradeType = ref<'interval' | 'daily'>('interval')
+const autoTradeIntervalMin = ref(60)
+const autoTradeTime = ref<string | null>('09:30')
+const autoTradeCashPct = ref(10)
+
+async function confirmAutoTrade() {
+  if (!checkedKeys.value.length) { message.warning(t('screener.emptySelect')); return }
+  addingSchedule.value = true
+  try {
+    const { data } = await api.post(`/api/screen/${runId.value}/to-schedule`, {
+      tickers: checkedKeys.value,
+      schedule_type: autoTradeType.value,
+      interval_minutes: autoTradeIntervalMin.value,
+      time_of_day: autoTradeTime.value || '09:30',
+      auto_trade_cash_fraction: Math.max(1, Math.min(100, autoTradeCashPct.value)) / 100,
+    })
+    showAutoTrade.value = false
+    message.success(t('screener.toScheduleDone', { created: data.created, skipped: data.skipped.length }))
+    router.push('/schedule')
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
+  } finally {
+    addingSchedule.value = false
+  }
+}
+
+// --- history ---
 const showHistory = ref(false)
 const historyItems = ref<any[]>([])
+const selectedHistory = ref<string[]>([])
+
+const allSelected = computed(() =>
+  historyItems.value.length > 0 && selectedHistory.value.length === historyItems.value.length)
+const someSelected = computed(() =>
+  selectedHistory.value.length > 0 && !allSelected.value)
+
+function toggleSelect(id: string, checked: boolean) {
+  if (checked) {
+    if (!selectedHistory.value.includes(id)) selectedHistory.value.push(id)
+  } else {
+    selectedHistory.value = selectedHistory.value.filter((x) => x !== id)
+  }
+}
+
+function toggleSelectAll(checked: boolean) {
+  selectedHistory.value = checked ? historyItems.value.map((h) => h.id) : []
+}
+
+function confirmBatchDelete() {
+  const n = selectedHistory.value.length
+  if (!n) return
+  dialog.warning({
+    title: t('screener.deleteTitle'),
+    content: t('screener.batchDeleteConfirm', { n }),
+    positiveText: t('common.delete'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: () => batchDeleteHistory(),
+  })
+}
+
+async function batchDeleteHistory() {
+  const ids = [...selectedHistory.value]
+  const results = await Promise.allSettled(ids.map((id) => api.delete(`/api/screen/${id}`)))
+  const ok = ids.filter((_, i) => results[i].status === 'fulfilled')
+  const okSet = new Set(ok)
+  historyItems.value = historyItems.value.filter((h) => !okSet.has(h.id))
+  selectedHistory.value = selectedHistory.value.filter((id) => !okSet.has(id))
+  // Clear the current view if its run was among those deleted.
+  if (okSet.has(runId.value)) {
+    runId.value = ''
+    candidates.value = []
+    strategy.value = null
+    checkedKeys.value = []
+    matched.value = null
+  }
+  const last = localStorage.getItem(LAST_RUN_KEY)
+  if (last && okSet.has(last)) localStorage.removeItem(LAST_RUN_KEY)
+  const failed = ids.length - ok.length
+  if (failed) message.warning(t('screener.batchDeletePartial', { ok: ok.length, failed }))
+  else message.success(t('screener.batchDeleteDone', { n: ok.length }))
+}
 
 // Fetch the list of past runs (server-persisted, newest first). Used both to
 // populate the drawer and to keep the history-button count current.
@@ -407,6 +628,9 @@ async function refreshHistory() {
   try {
     const { data } = await api.get('/api/screen')
     historyItems.value = data.items || []
+    // Drop any selected ids that no longer exist in the refreshed list.
+    const ids = new Set(historyItems.value.map((h) => h.id))
+    selectedHistory.value = selectedHistory.value.filter((id) => ids.has(id))
   } catch {
     /* non-fatal: history list is best-effort */
   }
@@ -415,6 +639,37 @@ async function refreshHistory() {
 function openHistory() {
   showHistory.value = true
   refreshHistory()
+}
+
+function confirmDelete(h: any) {
+  dialog.warning({
+    title: t('screener.deleteTitle'),
+    content: t('screener.deleteConfirm', { text: h.text || t('screener.noData') }),
+    positiveText: t('common.delete'),
+    negativeText: t('common.cancel'),
+    onPositiveClick: () => deleteHistory(h.id),
+  })
+}
+
+async function deleteHistory(id: string) {
+  try {
+    await api.delete(`/api/screen/${id}`)
+    historyItems.value = historyItems.value.filter((h) => h.id !== id)
+    selectedHistory.value = selectedHistory.value.filter((x) => x !== id)
+    // If the deleted run is the one currently displayed, clear the view so we
+    // don't leave stale results pointing at a record that no longer exists.
+    if (runId.value === id) {
+      runId.value = ''
+      candidates.value = []
+      strategy.value = null
+      checkedKeys.value = []
+      matched.value = null
+    }
+    if (localStorage.getItem(LAST_RUN_KEY) === id) localStorage.removeItem(LAST_RUN_KEY)
+    message.success(t('screener.deleteDone'))
+  } catch (e: any) {
+    message.error(e?.response?.data?.detail || e?.message || t('common.failed'))
+  }
 }
 
 async function loadHistory(id: string, opts: { silent?: boolean } = {}) {

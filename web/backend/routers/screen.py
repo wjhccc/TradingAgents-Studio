@@ -20,13 +20,27 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException
 
 from .. import database as db
-from ..models import ScreenRequest, ScreenToPaperRequest, ScreenToAnalyzeRequest
+from ..models import (
+    ScreenRequest, ScreenToPaperRequest, ScreenToAnalyzeRequest,
+    ScreenToScheduleRequest,
+)
 from ..screener_runner import ScreenerRunner
 
 router = APIRouter(prefix="/api/screen", tags=["screen"])
 
 # analysis_id-style live queue map, consumed by the /ws/screen/{id} socket.
 _active_queues: dict[str, asyncio.Queue] = {}
+
+# Strong refs to fire-and-forget run tasks so the GC can't drop a mid-flight
+# run (asyncio only weakly references a bare create_task result).
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
 
 
 @router.post("")
@@ -38,7 +52,7 @@ async def start_screen(req: ScreenRequest):
     queue = asyncio.Queue()
     _active_queues[run_id] = queue
     runner = ScreenerRunner(run_id, req.text, req.filters, req.top_n, req.use_llm, queue)
-    asyncio.create_task(_run_and_cleanup(run_id, runner))
+    _spawn(_run_and_cleanup(run_id, runner))
     return {"id": run_id, "status": "pending"}
 
 
@@ -64,6 +78,16 @@ async def get_screen(run_id: str):
     if not run:
         raise HTTPException(status_code=404, detail="选股记录不存在")
     return run
+
+
+@router.delete("/{run_id}")
+async def delete_screen(run_id: str):
+    """Delete a screen run from history."""
+    loop = asyncio.get_running_loop()
+    deleted = await loop.run_in_executor(None, db.delete_screen_run, run_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="选股记录不存在")
+    return {"ok": True}
 
 
 def _floor_lot(ticker: str, shares: float) -> float:
@@ -133,7 +157,11 @@ async def screen_to_paper(run_id: str, req: ScreenToPaperRequest):
 @router.post("/{run_id}/to-analyze")
 async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
     """Kick off a deep analysis for each selected ticker. Returns their ids."""
-    from .analyze import _active_queues as analyze_queues, _run_and_cleanup as analyze_cleanup
+    from .analyze import (
+        _active_queues as analyze_queues,
+        _run_and_cleanup as analyze_cleanup,
+        _spawn as analyze_spawn,
+    )
     from ..graph_runner import GraphRunner, build_config
     from ..models import AnalyzeRequest
 
@@ -141,6 +169,13 @@ async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
         raise HTTPException(status_code=400, detail="未选择任何股票")
     trade_date = req.trade_date or datetime.now().strftime("%Y-%m-%d")
     loop = asyncio.get_running_loop()
+
+    # Each ticker spawns a deep analysis that hard-requires an LLM. Check once
+    # up front so a missing key returns 400 instead of starting N doomed runs.
+    from ..llm_health import check_llm_ready
+    err = await loop.run_in_executor(None, check_llm_ready)
+    if err:
+        raise HTTPException(status_code=400, detail=f"LLM 未就绪，无法启动分析：{err}")
 
     started = []
     for ticker in req.tickers:
@@ -157,7 +192,74 @@ async def screen_to_analyze(run_id: str, req: ScreenToAnalyzeRequest):
         queue = asyncio.Queue()
         analyze_queues[analysis_id] = queue
         runner = GraphRunner(analysis_id, config, req.analysts, queue)
-        asyncio.create_task(analyze_cleanup(analysis_id, runner))
+        analyze_spawn(analyze_cleanup(analysis_id, runner))
         started.append({"ticker": ticker, "analysis_id": analysis_id})
 
     return {"started": started, "total": len(started)}
+
+
+@router.post("/{run_id}/to-schedule")
+async def screen_to_schedule(run_id: str, req: ScreenToScheduleRequest):
+    """Turn the selected tickers into an auto-trading portfolio.
+
+    Creates one schedule per ticker with ``auto_trade`` on. Default frequency is
+    ``interval`` (intraday monitoring every ``interval_minutes`` — the scheduler
+    only fires interval runs during trading hours); ``daily`` runs once a day at
+    ``time_of_day``. Tickers that already have an active schedule are skipped (no
+    dupes), mirroring ``schedule.bulk_from_holdings``.
+    """
+    from ..scheduler import compute_first_run_at
+
+    if not req.tickers:
+        raise HTTPException(status_code=400, detail="未选择任何股票")
+    is_interval = req.schedule_type == "interval"
+    if is_interval and req.interval_minutes < 5:
+        raise HTTPException(status_code=400, detail="interval_minutes 不能小于 5")
+    loop = asyncio.get_running_loop()
+    existing = await loop.run_in_executor(None, db.list_schedules, None)
+    active_tickers = {
+        s["ticker"].upper() for s in existing if s["status"] != "disabled"
+    }
+    interval_minutes = req.interval_minutes if is_interval else None
+    # First run brought forward to the next open trading moment (now if the
+    # market is already in session; interval/daily handled in compute_first_run_at).
+    next_run = compute_first_run_at(
+        req.schedule_type, interval_minutes, req.time_of_day, None, req.asset_type,
+    )
+    config = {
+        "max_debate_rounds": req.max_debate_rounds,
+        "max_risk_discuss_rounds": req.max_risk_discuss_rounds,
+        "llm_provider": None,
+        "deep_think_llm": None,
+        "quick_think_llm": None,
+        "output_language": "Chinese",
+        "checkpoint_enabled": False,
+    }
+    created = 0
+    skipped = []
+    for ticker in req.tickers:
+        t = ticker.strip().upper()
+        if t in active_tickers:
+            skipped.append(t)
+            continue
+        await loop.run_in_executor(
+            None,
+            lambda t=t: db.create_schedule(
+                name=f"自动交易: {t}",
+                ticker=t,
+                asset_type=req.asset_type,
+                schedule_type=req.schedule_type,
+                interval_minutes=interval_minutes,
+                time_of_day=None if is_interval else req.time_of_day,
+                day_of_week=None,
+                analysts=req.analysts,
+                config=config,
+                next_run_at=next_run,
+                from_holding=False,
+                auto_trade=req.auto_trade,
+                auto_trade_cash_fraction=req.auto_trade_cash_fraction,
+            ),
+        )
+        active_tickers.add(t)
+        created += 1
+    return {"created": created, "skipped": skipped}

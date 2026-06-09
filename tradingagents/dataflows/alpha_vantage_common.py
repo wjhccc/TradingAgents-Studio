@@ -7,6 +7,11 @@ from io import StringIO
 
 API_BASE_URL = "https://www.alphavantage.co/query"
 
+# Reused across calls so we get HTTP keep-alive + connection pooling instead of
+# a fresh TCP/TLS handshake per request. requests.Session is thread-safe for
+# plain GETs, which matters now that analysts fan out across threads.
+_session = requests.Session()
+
 def get_api_key() -> str:
     """Retrieve the API key for Alpha Vantage from environment variables."""
     api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
@@ -63,7 +68,7 @@ def _make_api_request(function_name: str, params: dict) -> dict | str:
         # Remove entitlement if it's None or empty
         api_params.pop("entitlement", None)
     
-    response = requests.get(API_BASE_URL, params=api_params)
+    response = _session.get(API_BASE_URL, params=api_params, timeout=30)
     response.raise_for_status()
 
     response_text = response.text

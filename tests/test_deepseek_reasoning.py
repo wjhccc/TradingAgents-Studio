@@ -233,8 +233,13 @@ class TestDeepSeekLiveStructuredOutput:
 class TestBaseClassIsolation:
     def test_normalized_does_not_propagate_reasoning_content(self):
         """The general-purpose NormalizedChatOpenAI must not carry
-        DeepSeek-specific behaviour. Only the subclass does."""
-        assert not hasattr(NormalizedChatOpenAI, "_get_request_payload") or (
-            NormalizedChatOpenAI._get_request_payload
-            is NormalizedChatOpenAI.__bases__[0]._get_request_payload
-        )
+        DeepSeek-specific behaviour. Only the subclass does.
+
+        Checks the class's own __dict__ rather than a specific base-class
+        position, so the assertion holds regardless of mixins (e.g. the
+        global-throttle mixin) inserted into the MRO.
+        """
+        assert "_get_request_payload" not in NormalizedChatOpenAI.__dict__
+        # The DeepSeek subclass *does* override it.
+        from tradingagents.llm_clients.openai_client import DeepSeekChatOpenAI
+        assert "_get_request_payload" in DeepSeekChatOpenAI.__dict__

@@ -3,7 +3,9 @@
 # Modified by TradingAgents-Studio contributors (2026) — see CHANGELOG.md
 # Original: github.com/TauricResearch/TradingAgents (Apache License 2.0)
 
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from langgraph.graph import END, START, StateGraph
 from langgraph.prebuilt import ToolNode
 
@@ -11,6 +13,7 @@ from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
 
 from .analyst_execution import build_analyst_execution_plan
+from .analyst_runner import run_analyst_loop
 from .conditional_logic import ConditionalLogic
 
 
@@ -25,14 +28,22 @@ class GraphSetup:
         conditional_logic: ConditionalLogic,
         analyst_concurrency_limit: int = 1,
         config: Optional[Dict] = None,
+        on_analyst_done: Optional[Callable[[str, str], None]] = None,
     ):
-        """Initialize with required components."""
+        """Initialize with required components.
+
+        ``on_analyst_done(report_key, report_text)`` — optional callback fired
+        from a worker thread as each analyst finishes inside the parallel
+        barrier, so the web layer can stream per-analyst completion in real time
+        instead of all-at-once when the barrier node returns.
+        """
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.tool_nodes = tool_nodes
         self.conditional_logic = conditional_logic
         self.analyst_concurrency_limit = analyst_concurrency_limit
         self.config = config or {}
+        self.on_analyst_done = on_analyst_done
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
@@ -82,11 +93,50 @@ class GraphSetup:
         # Create workflow
         workflow = StateGraph(AgentState)
 
-        # Add analyst nodes to the graph
-        for spec in plan.specs:
-            workflow.add_node(spec.agent_node, analyst_factories[spec.key]())
-            workflow.add_node(spec.clear_node, create_msg_delete())
-            workflow.add_node(spec.tool_node, self.tool_nodes[spec.key])
+        # ── Analysts: one parallel barrier node ──────────────────────────────
+        # Instead of chaining analysts (serial) we run them all concurrently
+        # inside a single node. Each analyst's ReAct loop runs over its own
+        # isolated message list (see analyst_runner), so there's no shared-state
+        # contention and no need for the old per-analyst tool / Msg-Clear nodes.
+        # LangGraph's synchronous executor does NOT parallelize sibling nodes
+        # within a step, so we own the concurrency here via a ThreadPoolExecutor.
+        analyst_nodes = {
+            spec.key: analyst_factories[spec.key]() for spec in plan.specs
+        }
+        max_recur = self.config.get("max_recur_limit", 100)
+        # 0/None → no cap → run every analyst at once.
+        limit = self.analyst_concurrency_limit or len(plan.specs)
+        max_workers = max(1, min(len(plan.specs), limit))
+
+        def run_analysts(state):
+            def _run(spec):
+                return spec, run_analyst_loop(
+                    analyst_nodes[spec.key],
+                    self.tool_nodes[spec.key],
+                    base_state=state,
+                    report_key=spec.report_key,
+                    max_iterations=max_recur,
+                )
+
+            merged: Dict[str, Any] = {}
+            with ThreadPoolExecutor(
+                max_workers=max_workers, thread_name_prefix="ta-analyst"
+            ) as ex:
+                futures = [ex.submit(_run, spec) for spec in plan.specs]
+                for fut in as_completed(futures):
+                    spec, result = fut.result()
+                    merged.update(result)
+                    # Stream this analyst's completion as soon as it lands, so
+                    # the UI shows analysts finishing one by one rather than all
+                    # at the barrier. Fired from a worker thread — the callback
+                    # must be thread-safe (graph_runner._enqueue_from_thread is).
+                    if self.on_analyst_done:
+                        self.on_analyst_done(
+                            spec.report_key, result.get(spec.report_key, "")
+                        )
+            return merged
+
+        workflow.add_node("Analysts", run_analysts)
 
         # Add other nodes
         workflow.add_node("Bull Researcher", bull_researcher_node)
@@ -98,29 +148,9 @@ class GraphSetup:
         workflow.add_node("Conservative Analyst", conservative_analyst)
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
 
-        # Define edges
-        # Start with the first analyst
-        workflow.add_edge(START, plan.specs[0].agent_node)
-
-        # Connect analysts in sequence
-        for i, spec in enumerate(plan.specs):
-            current_analyst = spec.agent_node
-            current_tools = spec.tool_node
-            current_clear = spec.clear_node
-
-            # Add conditional edges for current analyst
-            workflow.add_conditional_edges(
-                current_analyst,
-                getattr(self.conditional_logic, f"should_continue_{spec.key}"),
-                [current_tools, current_clear],
-            )
-            workflow.add_edge(current_tools, current_analyst)
-
-            # Connect to next analyst or to Bull Researcher if this is the last analyst
-            if i < len(plan.specs) - 1:
-                workflow.add_edge(current_clear, plan.specs[i + 1].agent_node)
-            else:
-                workflow.add_edge(current_clear, "Bull Researcher")
+        # Define edges: analysts run in parallel, then converge on the debate.
+        workflow.add_edge(START, "Analysts")
+        workflow.add_edge("Analysts", "Bull Researcher")
 
         # Add remaining edges
         workflow.add_conditional_edges(

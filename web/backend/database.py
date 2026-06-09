@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import os
+import threading
 from datetime import datetime
 from typing import Optional
 from contextlib import contextmanager
@@ -9,6 +10,15 @@ _DB_PATH = os.getenv(
     "TRADINGAGENTS_WEB_DB",
     os.path.join(os.path.expanduser("~"), ".tradingagents", "web_state.db"),
 )
+
+# One connection per thread, reused across calls. Request-path DB work runs on
+# the default executor's thread pool (run_in_executor(None, ...)), so without
+# reuse every call paid connection-open + PRAGMA + close. Reusing keeps the
+# same SQLite isolation per call (we still commit at the end of each get_db
+# block) while dropping the per-call setup cost. WAL is a persistent DB-level
+# property set once at init_db(); per-connection we only set the cheap
+# pragmas that don't persist (busy_timeout, synchronous, foreign_keys).
+_thread_local = threading.local()
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS analyses (
@@ -76,6 +86,8 @@ CREATE TABLE IF NOT EXISTS schedules (
     last_analysis_id TEXT,
     next_run_at      TEXT NOT NULL,
     from_holding     INTEGER NOT NULL DEFAULT 0,
+    auto_trade       INTEGER NOT NULL DEFAULT 0,
+    auto_trade_cash_fraction REAL,
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -198,23 +210,64 @@ def _ensure_dir():
     os.makedirs(os.path.dirname(_DB_PATH), exist_ok=True)
 
 
+def _get_conn() -> sqlite3.Connection:
+    """Return this thread's reused SQLite connection, creating it once.
+
+    The per-connection pragmas below are not persistent so they're set on
+    creation. WAL (a persistent DB property) is set once in init_db().
+
+    Keyed by the current ``_DB_PATH`` so that if the path changes (tests
+    monkeypatch it per case), a stale connection bound to the old DB is
+    replaced instead of silently querying the wrong file.
+    """
+    conn = getattr(_thread_local, "conn", None)
+    if conn is not None and getattr(_thread_local, "path", None) == _DB_PATH:
+        return conn
+    if conn is not None:
+        conn.close()
+    _ensure_dir()
+    conn = sqlite3.connect(_DB_PATH, timeout=30, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    _thread_local.conn = conn
+    _thread_local.path = _DB_PATH
+    return conn
+
+
 @contextmanager
 def get_db():
-    _ensure_dir()
-    conn = sqlite3.connect(_DB_PATH, timeout=30)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = _get_conn()
     try:
         yield conn
         conn.commit()
-    finally:
-        conn.close()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _add_column_if_missing(conn, table: str, col: str, ddl: str):
+    """Idempotent ALTER TABLE — adds ``col`` to ``table`` if absent.
+
+    The base schema only CREATEs tables IF NOT EXISTS, so columns added to
+    an existing DB need an explicit migration. Safe to run on every startup.
+    """
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+    if col not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
 
 
 def init_db():
     with get_db() as conn:
+        # WAL is a persistent DB-level property — set it once here rather than
+        # on every connection. Lets readers and the writer coexist, which the
+        # concurrent request path + background analyses rely on.
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(_SCHEMA)
+        # Migrations for columns added after a DB was first created.
+        _add_column_if_missing(conn, "schedules", "auto_trade", "INTEGER NOT NULL DEFAULT 0")
+        _add_column_if_missing(conn, "schedules", "auto_trade_cash_fraction", "REAL")
 
 
 # --- Analyses CRUD ---
@@ -298,6 +351,31 @@ def delete_analysis(id: str):
         conn.execute("DELETE FROM analyses WHERE id = ?", (id,))
 
 
+def fail_stale_runs() -> int:
+    """Mark interrupted analyses / screen runs as failed on startup.
+
+    A process kill (crash, reload, Ctrl-C) leaves rows stuck in
+    'pending'/'running' forever — their in-memory runner is gone but the DB
+    still says they're live. We reconcile that at boot so the history/screener
+    views don't show ghost runs the user then can't get rid of. Returns the
+    number of rows reconciled.
+    """
+    now = datetime.utcnow().isoformat() + "Z"
+    msg = "中断（服务重启）"
+    with get_db() as conn:
+        a = conn.execute(
+            "UPDATE analyses SET status = 'failed', error_msg = ?, completed_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (msg, now),
+        )
+        s = conn.execute(
+            "UPDATE screen_runs SET status = 'error', error_msg = ?, completed_at = ? "
+            "WHERE status IN ('pending', 'running')",
+            (msg, now),
+        )
+    return (a.rowcount or 0) + (s.rowcount or 0)
+
+
 # --- Screen runs (选股) CRUD ---
 
 def create_screen_run(id: str, text: str) -> dict:
@@ -357,6 +435,13 @@ def list_screen_runs(limit: int = 50) -> list:
             (limit,),
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def delete_screen_run(id: str) -> bool:
+    """Delete one screen run. Returns True if a row was removed."""
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM screen_runs WHERE id = ?", (id,))
+    return cur.rowcount > 0
 
 
 def get_dashboard_stats() -> dict:
@@ -513,17 +598,21 @@ def create_schedule(
     config: dict,
     next_run_at: str,
     from_holding: bool = False,
+    auto_trade: bool = False,
+    auto_trade_cash_fraction: Optional[float] = None,
 ) -> dict:
     now = datetime.utcnow().isoformat() + "Z"
     with get_db() as conn:
         cur = conn.execute(
             "INSERT INTO schedules (name, ticker, asset_type, schedule_type, "
             "interval_minutes, time_of_day, day_of_week, analysts, config_json, "
-            "next_run_at, from_holding, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "next_run_at, from_holding, auto_trade, auto_trade_cash_fraction, "
+            "created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (name, ticker, asset_type, schedule_type, interval_minutes, time_of_day,
              day_of_week, json.dumps(analysts), json.dumps(config), next_run_at,
-             1 if from_holding else 0, now, now),
+             1 if from_holding else 0, 1 if auto_trade else 0,
+             auto_trade_cash_fraction, now, now),
         )
         sid = cur.lastrowid
         row = conn.execute("SELECT * FROM schedules WHERE id = ?", (sid,)).fetchone()
@@ -557,12 +646,14 @@ def update_schedule(schedule_id: int, **fields) -> Optional[dict]:
     allowed = {
         "name", "schedule_type", "interval_minutes", "time_of_day", "day_of_week",
         "analysts", "config_json", "status", "next_run_at", "last_run_at",
-        "last_analysis_id", "fail_count",
+        "last_analysis_id", "fail_count", "auto_trade", "auto_trade_cash_fraction",
     }
     cols, vals = [], []
     for k, v in fields.items():
         if k not in allowed or v is None:
             continue
+        if k == "auto_trade":
+            v = 1 if v else 0
         cols.append(f"{k} = ?")
         vals.append(json.dumps(v) if k in ("analysts",) and isinstance(v, list) else v)
     if not cols:
@@ -625,7 +716,7 @@ def record_schedule_fire(
 
 # --- Paper trading ---
 
-def ensure_default_paper_account(initial_cash: float = 1_000_000.0) -> dict:
+def ensure_default_paper_account(initial_cash: float = 10_000.0) -> dict:
     """Create the default paper-trading account if none exists. Returns the
     sole account (creates one if the table is empty, otherwise returns the
     first one). Most users only need a single virtual account."""
@@ -661,9 +752,14 @@ def list_paper_accounts() -> list:
     return [dict(r) for r in rows]
 
 
-def reset_paper_account(account_id: int) -> Optional[dict]:
-    """Wipe positions + orders + nav snapshots for an account and reset cash
-    to initial_cash. Used when the user wants to start a fresh simulation."""
+def reset_paper_account(account_id: int,
+                        initial_cash: Optional[float] = None) -> Optional[dict]:
+    """Wipe positions + orders + nav snapshots for an account and reset cash.
+
+    With ``initial_cash`` (>0) the account's starting capital (本金) is changed
+    to that value and cash reset to it — lets the user run a small book (e.g.
+    ¥10,000). Without it, the existing ``initial_cash`` is reused. Used when the
+    user wants to start a fresh simulation."""
     now = datetime.utcnow().isoformat() + "Z"
     with get_db() as conn:
         row = conn.execute(
@@ -671,12 +767,14 @@ def reset_paper_account(account_id: int) -> Optional[dict]:
         ).fetchone()
         if not row:
             return None
+        new_cash = (float(initial_cash) if initial_cash is not None and initial_cash > 0
+                    else row["initial_cash"])
         conn.execute("DELETE FROM paper_positions WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM paper_orders WHERE account_id = ?", (account_id,))
         conn.execute("DELETE FROM paper_nav WHERE account_id = ?", (account_id,))
         conn.execute(
-            "UPDATE paper_accounts SET cash = ?, updated_at = ? WHERE id = ?",
-            (row["initial_cash"], now, account_id),
+            "UPDATE paper_accounts SET initial_cash = ?, cash = ?, updated_at = ? WHERE id = ?",
+            (new_cash, new_cash, now, account_id),
         )
     return get_paper_account(account_id)
 

@@ -3,10 +3,11 @@ from typing import Any, Optional
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 from .base_client import BaseLLMClient, normalize_content
+from .throttle import ThrottledLLMMixin
 from .validators import validate_model
 
 
-class NormalizedChatGoogleGenerativeAI(ChatGoogleGenerativeAI):
+class NormalizedChatGoogleGenerativeAI(ThrottledLLMMixin, ChatGoogleGenerativeAI):
     """ChatGoogleGenerativeAI with normalized content output.
 
     Gemini 3 models return content as list of typed blocks.

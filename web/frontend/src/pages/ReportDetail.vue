@@ -20,8 +20,8 @@
           <n-descriptions-item :label="t('report.summary.signal')">{{ analysis.signal }}</n-descriptions-item>
           <n-descriptions-item :label="t('report.summary.confidence')">{{ analysis.confidence || 'N/A' }}</n-descriptions-item>
           <n-descriptions-item :label="t('report.summary.status')">{{ analysis.status }}</n-descriptions-item>
-          <n-descriptions-item :label="t('report.summary.createdAt')">{{ analysis.created_at }}</n-descriptions-item>
-          <n-descriptions-item :label="t('report.summary.completedAt')">{{ analysis.completed_at || '-' }}</n-descriptions-item>
+          <n-descriptions-item :label="t('report.summary.createdAt')">{{ formatDateTime(analysis.created_at) }}</n-descriptions-item>
+          <n-descriptions-item :label="t('report.summary.completedAt')">{{ formatDateTime(analysis.completed_at) }}</n-descriptions-item>
           <n-descriptions-item :label="t('report.summary.assetType')">{{ analysis.asset_type }}</n-descriptions-item>
         </n-descriptions>
       </n-card>
@@ -68,7 +68,7 @@
             :key="ev.id"
             :type="ev.event_type === 'error' ? 'error' : 'success'"
             :title="ev.agent_name"
-            :time="ev.timestamp"
+            :time="formatTime(ev.timestamp)"
           />
         </n-timeline>
       </n-card>
@@ -113,6 +113,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { marked } from 'marked'
 import { useMessage } from 'naive-ui'
 import api from '../api'
+import { formatDateTime, formatTime } from '../utils/datetime'
 import EventReport from '../components/EventReport.vue'
 import DebateThread from '../components/DebateThread.vue'
 

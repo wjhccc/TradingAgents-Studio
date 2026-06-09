@@ -20,11 +20,16 @@ class AnalystExecutionPlanTests(unittest.TestCase):
 
     def test_rejects_unknown_analyst_keys(self):
         with self.assertRaises(ValueError):
-            build_analyst_execution_plan(["market", "macro"])
+            build_analyst_execution_plan(["market", "not_a_real_analyst"])
 
-    def test_requires_positive_concurrency_limit(self):
+    def test_zero_concurrency_limit_means_unbounded(self):
+        # 0 now means "no cap" (run every analyst at once), not invalid.
+        plan = build_analyst_execution_plan(["market"], concurrency_limit=0)
+        self.assertEqual(plan.concurrency_limit, 0)
+
+    def test_rejects_negative_concurrency_limit(self):
         with self.assertRaises(ValueError):
-            build_analyst_execution_plan(["market"], concurrency_limit=0)
+            build_analyst_execution_plan(["market"], concurrency_limit=-1)
 
     def test_get_initial_analyst_node_uses_plan_metadata(self):
         plan = build_analyst_execution_plan(["fundamentals", "news"])

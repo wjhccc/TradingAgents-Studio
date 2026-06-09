@@ -154,7 +154,7 @@ For production single-process deployment, build the frontend once and let
 the backend serve the static bundle:
 
 ```bash
-cd web/frontend && npm run build
+cd web/frontend && npx vite build   # use vite build, not npm run build: skips the vue-tsc type-check so type warnings can't block the bundle
 cd ../..
 tradingagents-web              # serves the built UI at http://127.0.0.1:8000/
 ```
@@ -165,15 +165,98 @@ tradingagents-web              # serves the built UI at http://127.0.0.1:8000/
 tradingagents
 ```
 
-**Docker (CLI workflow):**
+**Docker (Web Studio, recommended):**
 
 ```bash
-cp .env.example .env
-docker compose run --rm tradingagents
+cp .env.example .env      # set at least one LLM key
+docker compose up -d --build
+# open http://localhost:8000
 ```
 
-> The Docker image targets the CLI workflow. To run the Web Studio under
-> Docker, expose port `8000` and build the frontend before container start.
+The image installs the `[all]` extras (Web + A-share + sentiment stacks),
+serves the pre-built frontend, and publishes port `8000`. The server binds
+`0.0.0.0` and runs without autoreload inside the container (set via
+`TRADINGAGENTS_WEB_HOST` / `TRADINGAGENTS_WEB_RELOAD` in `compose`). Analysis
+data persists in the `tradingagents_data` volume across restarts.
+
+```bash
+docker compose logs -f tradingagents   # follow logs
+docker compose down                    # stop (keeps the data volume)
+```
+
+> Ollama users: `docker compose --profile ollama up -d --build` also starts a
+> local Ollama service alongside the app.
+
+---
+
+## 🚢 Deploy to 1Panel (or any Linux server)
+
+The whole Web Studio is a **single process**: the FastAPI backend listens on
+`8000` and serves the built frontend (`web/frontend/dist`) itself. The frontend
+calls the API via relative paths and opens WebSockets against `location.host`,
+so just run the backend and access it same-origin — **do not split the frontend
+into a separate static site** (splitting breaks the `/ws/` live updates).
+
+### Step 1 — build the frontend locally and package
+
+The server runtime usually has only Python (no Node), so build the frontend
+**locally** before uploading:
+
+```bash
+# 1) Build the frontend (vite build skips the type-check)
+cd web/frontend && npx vite build && cd ../..
+
+# 2) Make a clean deploy tarball (excludes venv / node_modules / caches / logs)
+#    Works with Windows (bundled tar) / macOS / Linux:
+tar -czf deploy.tar.gz \
+  --exclude='*__pycache__*' --exclude='*.pyc' --exclude='*.log' \
+  --exclude='web/frontend/node_modules' \
+  tradingagents cli web pyproject.toml README.md .env uv.lock
+```
+
+> The tarball **must include** `web/frontend/dist` (the built UI) and `.env`
+> (your keys/config). After changing frontend `src/` code, re-run
+> `npx vite build` before repackaging, or the live site stays on the old UI.
+
+### Step 2 — create a Python runtime in 1Panel
+
+Upload and extract `deploy.tar.gz` on the server, then fill the 1Panel
+**Runtime → Python** form:
+
+| Field | Value |
+| --- | --- |
+| Project dir | the extracted folder **containing `pyproject.toml`** |
+| App / version | Python **3.12** (avoid 3.14 — akshare/pandas may lack prebuilt wheels) |
+| Start command | see below |
+| Port | `8000` → external `8000` |
+| Mount | host `/opt/tradingagents-data` → container `/data` |
+| Env var | `HOME` = `/data` (so the SQLite db and logs land on the mounted volume and survive container rebuilds)<br>**`TRADINGAGENTS_WEB_PASSWORD` = a strong password** (set this for any public deployment, see below) |
+
+> **🔒 Set an access password!** A bare public IP gets scanned by bots that
+> will hit the analysis endpoints and burn your LLM tokens. With
+> `TRADINGAGENTS_WEB_PASSWORD` set, the browser shows a native login prompt on
+> first visit (username defaults to `admin`, override with `TRADINGAGENTS_WEB_USER`);
+> leave it unset only for localhost. Adding it under 1Panel's **Env var** tab is
+> easiest — changing the password needs no repackaging. Note that over plain
+> `http://IP:8000` the password travels unencrypted, so pair it with a domain +
+> HTTPS (below) when you can.
+
+Start command (single line):
+
+```bash
+pip install ".[web,cn]" && python -m uvicorn web.backend.main:app --host 0.0.0.0 --port 8000
+```
+
+Then open `http://<server-ip>:8000` for the full app. API keys and config are
+loaded automatically from `.env` in the project dir (via `load_dotenv` in
+`tradingagents/__init__.py`) — no need to fill them into the panel one by one.
+
+### (Optional) domain + HTTPS
+
+To serve over a domain/443, add a 1Panel **Website → reverse proxy** pointing to
+`127.0.0.1:8000` and **enable WebSocket support** (forward the `Upgrade` /
+`Connection` headers) — otherwise live analysis progress and screener updates
+will drop.
 
 ---
 
@@ -209,6 +292,13 @@ A single complete analysis (4 analysts + 1 debate round, ~5–10K input tokens
 > Numbers are rough estimates from typical Studio runs; your usage will vary
 > with analyst count, debate rounds, and report length. **All Studio data
 > sources are free** — paid keys (Tushare, Alpha Vantage) are optional.
+>
+> **Analysts run in parallel** (since `0.5.0`): the analyst stage fans out
+> instead of running one model at a time, so adding more analysts barely moves
+> wall-clock time (it's bounded by the slowest analyst, not their sum). A
+> process-wide LLM concurrency cap (`TRADINGAGENTS_LLM_CONCURRENCY`, default 16)
+> with automatic 429 backoff keeps multi-ticker batches from tripping provider
+> rate limits.
 
 ---
 
