@@ -36,6 +36,12 @@ Studio **parses the same reports** into structured visualisations.
   rendered as a vertical chain with sentiment-tinted borders.
 
   ![Causal chain visualisation](assets/screenshots/causal-chain.png)
+- **Structured news report** — the news analyst's output is parsed into a
+  *核心发现速读* (key-takeaways) block plus a *关键事件清单* table that tags each
+  item bullish / bearish with a weight and a one-line read, instead of a flat
+  Markdown dump.
+
+  ![Structured news & trend report](assets/screenshots/news-report.png)
 - **Bull / Bear as a dialogue** — no more two long blocks of text.
   Left/right chat bubbles split by round, role-tagged, with a live-pulse on
   the freshest turn. Risk debate (aggressive / conservative / neutral) gets
@@ -70,6 +76,7 @@ Studio bundles the muscles a research workbench actually needs:
 | Feature | What it does |
 |---|---|
 | **Natural-language entry** | "研究茅台短期" / "AAPL 30 天" → ticker + date + period auto-filled. Rule-based first (deterministic, free), optional LLM fallback. |
+| **Stock screener (选股)** | Rank an A-share universe by factor score (momentum + PE/PB/turnover/capital-flow), then attach a **deterministic, board-aware 操作建议** — an action signal (好 / 观望 / 谨慎 / 避免) with today/next-day timing that down-ranks limit-up boards and over-extended moves, so the Top-N is actually *buyable* rather than just the biggest gainers. No LLM, no keyword dictionary. **One-click hand-off** of the picks to analyze / paper-trade / scheduled analysis. |
 | **Holdings tracking** | A-share / global positions with shares, cost, real-time quote, P&L, and **latest analysis signal per ticker**. CSV import accepts 代码/股数/成本价 Chinese headers. |
 | **Scheduled analyses** | Interval / daily / weekly background runs. Analyst + LLM config snapshotted at create time. Auto-disable after 3 consecutive failures so a broken setup can't silently burn through your quota. |
 | **Paper trading** | Virtual account, cash, positions, daily NAV snapshots. **One-click "按此决策模拟下单"** parses the trader proposal's Action + Entry/Target/Stop and opens a virtual position. Enforces A-share T+1. |
@@ -80,6 +87,8 @@ Studio bundles the muscles a research workbench actually needs:
 
 Everything inherited from upstream — the LangGraph workflow, multi-provider LLMs,
 decision log, checkpoint resume — still works as before.
+
+![Stock screener with actionable 操作建议](assets/screenshots/screener.png)
 
 ---
 
@@ -93,6 +102,7 @@ decision log, checkpoint resume — still works as before.
 | **A-share analysts** | — | `cn_social`, `event`, `capital_flow`, `macro` |
 | **A-share data** | — | AKShare (free) + Tushare Pro (optional) |
 | **Holdings / paper / backtest** | — | ✅ |
+| **Stock screener (选股)** | — | ✅ (factor score + board-aware action signal → one-click analyze / paper / schedule) |
 | **Decision-quality dashboard** | — | ✅ (win-rate / alpha / calibration per analyst combo & LLM) |
 | **Scheduled analyses** | — | ✅ |
 | **Natural-language input** | — | ✅ (rule-based + optional LLM) |
@@ -327,6 +337,7 @@ A single complete analysis (4 analysts + 1 debate round, ~5–10K input tokens
                  │                                                        │
                  │   ▸ Natural-language analyze entry                     │
                  │   ▸ Causal-chain + debate-bubble visualisation         │
+                 │   ▸ Factor screener → one-click analyze/paper/schedule │
                  │   ▸ Holdings tracking (real-time quote, latest signal) │
                  │   ▸ Scheduled analyses (interval / daily / weekly)     │
                  │   ▸ Paper trading (from-decision orders, NAV curve)    │
@@ -499,6 +510,10 @@ tradingagents/                  # core agent framework (inherited + extended)
 │   ├── metrics.py
 │   ├── slippage.py
 │   └── signals/                # signal sources (memory_log, future: rule / live_agent)
+├── screener/                   # Studio — factor screen + actionable signals
+│   ├── universe.py             # candidate universe + metric fetch
+│   ├── factors.py              # factor scoring / ranking
+│   └── signals.py              # board-aware 操作建议 (no LLM, no I/O)
 ├── dataflows/                  # data-fetching layer
 │   ├── _proxy.py               # Studio — NO_PROXY bootstrap for CN data domains
 │   ├── akshare_stock.py        # Studio — A-share market data
@@ -528,7 +543,8 @@ web/                            # Web Studio
 │       ├── dashboard.py
 │       ├── holdings.py         # holdings CRUD + CSV import + quote
 │       ├── schedule.py         # Studio — schedule CRUD + trigger + bulk-from-holdings
-│       ├── paper.py            # Studio — paper trading
+│       ├── paper.py            # Studio — paper trading + auto-trade
+│       ├── screen.py           # Studio — screener run + to-analyze/paper/schedule
 │       ├── quote.py            # Studio — K-line OHLC (daily + intraday)
 │       ├── backtest.py         # Studio — backtest runs / curve / trades
 │       └── settings.py         # incl. /api/api-keys + /api/model-catalog

@@ -36,6 +36,10 @@ Studio **解析同样的报告**,把它们转成结构化可视化。
   以纵向链条渲染,卡片边框按情绪正负染色。
 
   ![因果链可视化](assets/screenshots/causal-chain.png)
+- **结构化新闻报告** — 新闻分析师的输出会被解析成「核心发现速读」+「关键事件清单」
+  表格,每条事件标注利好 / 利空、权重和一句话含义,而不是一整段 Markdown。
+
+  ![结构化新闻与趋势报告](assets/screenshots/news-report.png)
 - **多空双方变成对话** — 不再是两大段长文。
   左右气泡按轮次分割,标注角色,最新一轮带实时脉冲动画。
   风险辩论(激进 / 保守 / 中立)用三种颜色同样处理。
@@ -68,6 +72,7 @@ Studio 集成了研究工作台真正需要的肌肉:
 | 功能 | 干什么用 |
 |---|---|
 | **自然语言入口** | "研究茅台短期" / "AAPL 30 天" → 自动填充代码 + 日期 + 周期。默认走规则解析(确定性、免费),可选 LLM 兜底。 |
+| **选股 (Screener)** | 按因子打分(动量 + PE/PB/换手 + 资金流)对 A 股票池排序,并给出**确定性、识别板块规则的「操作建议」** —— 操作信号(好 / 观望 / 谨慎 / 避免)+ 今日/次日时点,会给一字涨停、过度拉升的票降权,让 Top-N 是真能买进的票,而不只是涨得最多的。不调 LLM、不靠关键词词典。选出的票可**一键交给 分析 / 模拟交易 / 定时分析**。 |
 | **持仓追踪** | A 股 / 全球持仓,记录股数、成本、实时报价、盈亏,以及**每个标的最新一次分析信号**。CSV 导入兼容 代码/股数/成本价 等中文表头。 |
 | **定时分析** | 间隔 / 每日 / 每周后台运行。分析师与 LLM 配置在创建时快照保留。连续失败 3 次自动停用,坏配置不会悄悄烧光你的额度。 |
 | **模拟交易** | 虚拟账户、现金、持仓、每日 NAV 快照。**一键"按此决策模拟下单"** 会解析 trader proposal 的 Action + Entry/Target/Stop 并开一笔虚拟仓位。强制执行 A 股 T+1。 |
@@ -77,6 +82,8 @@ Studio 集成了研究工作台真正需要的肌肉:
 
 从上游继承的所有东西 —— LangGraph 工作流、多 provider LLM、决策日志、断点续跑 ——
 全部照常工作。
+
+![选股页:带可操作的「操作建议」](assets/screenshots/screener.png)
 
 ---
 
@@ -90,6 +97,7 @@ Studio 集成了研究工作台真正需要的肌肉:
 | **A 股分析师** | — | `cn_social`、`event`、`capital_flow`、`macro` |
 | **A 股数据源** | — | AKShare(免费) + Tushare Pro(可选) |
 | **持仓 / 模拟交易 / 回测** | — | ✅ |
+| **选股 (Screener)** | — | ✅(因子打分 + 识别板块的操作信号 → 一键 分析 / 模拟 / 定时) |
 | **定时分析** | — | ✅ |
 | **自然语言输入** | — | ✅(规则 + 可选 LLM) |
 | **LLM Provider** | OpenAI / Google / Anthropic | + DeepSeek / 通义 / 智谱 / MiniMax / OpenRouter / Ollama / Azure |
@@ -309,6 +317,7 @@ pip install -i https://pypi.tuna.tsinghua.edu.cn/simple ".[web,cn]" && python -m
                  │                                                        │
                  │   ▸ 自然语言分析入口                                    │
                  │   ▸ 因果链 + 辩论气泡可视化                             │
+                 │   ▸ 选股(因子打分 → 一键 分析/模拟/定时)              │
                  │   ▸ 持仓追踪(实时报价、最新信号)                      │
                  │   ▸ 定时分析(间隔 / 每日 / 每周)                      │
                  │   ▸ 模拟交易(按决策下单、NAV 曲线)                    │
@@ -479,6 +488,10 @@ tradingagents/                  # 核心 Agent 框架(继承自上游 + 扩展)
 │   ├── metrics.py
 │   ├── slippage.py
 │   └── signals/                # 信号源(memory_log,未来:rule / live_agent)
+├── screener/                   # Studio — 因子选股 + 可操作信号
+│   ├── universe.py             # 候选票池 + 指标抓取
+│   ├── factors.py              # 因子打分 / 排序
+│   └── signals.py              # 识别板块的「操作建议」(不调 LLM、无 I/O)
 ├── dataflows/                  # 数据获取层
 │   ├── _proxy.py               # Studio — 为 CN 域名做 NO_PROXY bootstrap
 │   ├── akshare_stock.py        # Studio — A 股行情数据
@@ -508,7 +521,8 @@ web/                            # Web Studio
 │       ├── dashboard.py
 │       ├── holdings.py         # 持仓 CRUD + CSV 导入 + 实时报价
 │       ├── schedule.py         # Studio — schedule CRUD + 立即触发 + 从持仓批量创建
-│       ├── paper.py            # Studio — 模拟交易
+│       ├── paper.py            # Studio — 模拟交易 + 自动交易
+│       ├── screen.py           # Studio — 选股运行 + 一键 分析/模拟/定时
 │       ├── quote.py            # Studio — K 线 OHLC(日线 + 分钟线)
 │       ├── backtest.py         # Studio — 回测运行 / 曲线 / 成交
 │       └── settings.py         # 含 /api/api-keys + /api/model-catalog
